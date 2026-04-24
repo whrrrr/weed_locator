@@ -1,0 +1,4 @@
+# 读取所有关节当前位置
+---
+float64[] positions
+bool success

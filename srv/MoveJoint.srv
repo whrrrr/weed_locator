@@ -1,0 +1,5 @@
+# 单关节移动
+uint8 joint_id
+float64 target_position
+---
+bool success

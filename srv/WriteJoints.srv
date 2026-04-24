@@ -1,0 +1,4 @@
+# 写入所有关节目标位置
+float64[] target_positions
+---
+bool success

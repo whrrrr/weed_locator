@@ -1,0 +1,7 @@
+# 逆运动学求解请求
+geometry_msgs/Pose target_pose
+---
+# 逆运动学求解响应
+bool success
+string message
+float64[] joint_positions

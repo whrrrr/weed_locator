@@ -1,0 +1,80 @@
+# SO-ARM101 运动学配置文件
+# 基于 MuammerBay/SO-ARM_ROS2_URDF 的 URDF 提取
+
+robot_name: "so101_new_calib"
+
+# 关节配置 (与 dynamixel_node.py 中的 joint_ids 对应)
+joints:
+  - name: "Rotation"      # ID1: 基座旋转
+    type: "revolute"
+    axis: [0, 0, 1]
+    limit: 
+      lower: -1.91986  # rad (-110°)
+      upper: 1.91986   # rad (110°)
+    # 编码器范围 (Dynamixel 原始值)
+    encoder_min: 800
+    encoder_max: 3200
+    # 转换: encoder_value = (angle + 1.91986) / 3.83972 * (3200 - 800) + 800
+    
+  - name: "Pitch"         # ID2: 肩部俯仰
+    type: "revolute"
+    axis: [0, 0, 1]
+    limit:
+      lower: -1.74533  # rad (-100°)
+      upper: 1.74533   # rad (100°)
+    encoder_min: 1000
+    encoder_max: 3000
+    
+  - name: "Elbow"         # ID3: 肘部
+    type: "revolute"
+    axis: [0, 0, 1]
+    limit:
+      lower: -1.74533  # rad (-100°)
+      upper: 1.5708    # rad (90°)
+    encoder_min: 1000
+    encoder_max: 3000
+    
+  - name: "Wrist_Pitch"   # ID4: 腕俯仰
+    type: "revolute"
+    axis: [0, 0, 1]
+    limit:
+      lower: -1.65806  # rad (-95°)
+      upper: 1.65806   # rad (95°)
+    encoder_min: 500
+    encoder_max: 3500
+    
+  - name: "Wrist_Roll"    # ID5: 腕旋转
+    type: "revolute"
+    axis: [0, 0, 1]
+    limit:
+      lower: -2.79253  # rad (-160°)
+      upper: 2.79253   # rad (160°)
+    encoder_min: 500
+    encoder_max: 3500
+    
+  - name: "Jaw"           # ID6: 夹爪
+    type: "revolute"
+    axis: [0, 0, 1]
+    limit:
+      lower: -0.174533  # rad (-10°)
+      upper: 1.74533    # rad (100°)
+    encoder_min: 500
+    encoder_max: 3500
+
+# 连杆长度 (从 URDF 提取, 单位: 米)
+link_lengths:
+  base_to_shoulder: 0.0949      # 基座到肩部
+  shoulder_to_upper_arm: 0.1126  # 肩部到上臂
+  upper_arm_to_lower_arm: 0.1349  # 上臂到前臂
+  lower_arm_to_wrist: 0.0611      # 前臂到腕部
+  wrist_to_gripper: 0.0181       # 腕部到夹爪
+
+# 末端执行器
+end_effector:
+  name: "gripper"
+  link: "jaw"
+  
+# 标定参数 (手眼标定后更新)
+hand_eye_calibration:
+  T_base_camera: null  # 4x4 矩阵, 标定后填充
+  T_camera_base: null  # 4x4 矩阵, T_base_camera 的逆
