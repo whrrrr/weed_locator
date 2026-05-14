@@ -85,6 +85,14 @@ install(PROGRAMS weed_locator/dynamixel_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME dynamixel_node
 )
+install(PROGRAMS weed_locator/delta_gcode_bridge.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME delta_gcode_bridge
+)
+install(PROGRAMS weed_locator/target_commander.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME target_commander
+)
 install(PROGRAMS weed_locator/weed_fusion_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME weed_fusion_node
@@ -107,6 +115,18 @@ install(PROGRAMS scripts/arm_keyboard_control.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME arm_keyboard_control
 )
+install(PROGRAMS scripts/delta_keyboard_jog.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME delta_keyboard_jog
+)
+install(PROGRAMS scripts/delta_charuco_calibration.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME delta_charuco_calibration
+)
+install(PROGRAMS scripts/delta_visual_pick_demo.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME delta_visual_pick_demo
+)
 install(PROGRAMS scripts/test_ik_service.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME test_ik_service
@@ -118,6 +138,54 @@ install(PROGRAMS scripts/fake_dynamixel_node.py
 install(PROGRAMS scripts/joint_state_bridge.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME joint_state_bridge
+)
+install(PROGRAMS scripts/workspace_checker.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME workspace_checker
+)
+install(PROGRAMS scripts/workspace_boundary_runner.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME workspace_boundary_runner
+)
+install(PROGRAMS scripts/conveyor_pick_scheduler.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME conveyor_pick_scheduler
+)
+install(PROGRAMS scripts/conveyor_controller.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME conveyor_controller
+)
+install(PROGRAMS scripts/chess_detector.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME chess_detector
+)
+install(PROGRAMS scripts/track_line_tuner.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME track_line_tuner
+)
+install(PROGRAMS scripts/lerobot_so101_bridge.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_so101_bridge
+)
+install(PROGRAMS scripts/lerobot_ik_jog.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_ik_jog
+)
+install(PROGRAMS scripts/lerobot_ik_keyboard_jog.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_ik_keyboard_jog
+)
+install(PROGRAMS scripts/lerobot_joint_jog.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_joint_jog
+)
+install(PROGRAMS scripts/lerobot_joint_diagnostic.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_joint_diagnostic
+)
+install(PROGRAMS scripts/lerobot_setup_single_motor.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_setup_single_motor
 )
 
 # 安装 launch 文件

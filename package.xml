@@ -9,8 +9,12 @@
 
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
+  <depend>cv_bridge</depend>
   <depend>vision_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>message_filters</depend>
   <depend>rosidl_default_generators</depend>
   <depend>rosidl_generator_python</depend>
