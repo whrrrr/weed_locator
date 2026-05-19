@@ -15,7 +15,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Point
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Empty
+from std_msgs.msg import Empty, String
 
 try:
     from ultralytics import YOLO
@@ -42,6 +42,8 @@ class DeltaVisualPickDemo(Node):
 
         self.declare_parameter('image_topic', '/camera/color/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/color/camera_info')
+        self.declare_parameter('depth_topic', '/camera/depth/image_raw')
+        self.declare_parameter('depth_camera_info_topic', '/camera/depth/camera_info')
         self.declare_parameter('delta_move_topic', '/delta_arm/move_to')
         self.declare_parameter('trigger_topic', '/delta_visual_pick_demo/trigger')
         self.declare_parameter(
@@ -49,11 +51,31 @@ class DeltaVisualPickDemo(Node):
             '/home/whr/cc_ws/tros_ws/calibration_targets/delta_hand_eye_filtered.yaml',
         )
         self.declare_parameter('work_z_mm', -170.0)
+        self.declare_parameter('use_depth', False)
+        self.declare_parameter('depth_aligned_to_color', True)
+        self.declare_parameter('depth_roi_px', 9)
+        self.declare_parameter('depth_min_m', 0.12)
+        self.declare_parameter('depth_max_m', 1.20)
+        self.declare_parameter('use_depth_for_z', False)
+        self.declare_parameter('depth_z_offset_mm', 0.0)
         self.declare_parameter('approach_z_mm', -155.0)
         self.declare_parameter('move_to_work_z', False)
+        self.declare_parameter('use_staged_motion', True)
+        self.declare_parameter('home_clear_x_mm', 0.0)
+        self.declare_parameter('home_clear_y_mm', 0.0)
+        self.declare_parameter('first_drop_z_mm', -170.0)
+        self.declare_parameter('xy_travel_z_mm', -170.0)
+        self.declare_parameter('feedrate', 80.0)
         self.declare_parameter('offset_x_mm', 10.0)
         self.declare_parameter('offset_y_mm', -5.0)
         self.declare_parameter('offset_z_mm', 3.0)
+        self.declare_parameter('enforce_workspace_limits', True)
+        self.declare_parameter('x_min_mm', -100.0)
+        self.declare_parameter('x_max_mm', 100.0)
+        self.declare_parameter('y_min_mm', -100.0)
+        self.declare_parameter('y_max_mm', 100.0)
+        self.declare_parameter('z_min_mm', -220.0)
+        self.declare_parameter('z_max_mm', -140.0)
         self.declare_parameter('min_area_px', 250.0)
         self.declare_parameter('max_area_px', 200000.0)
         self.declare_parameter('blur_kernel', 5)
@@ -77,12 +99,27 @@ class DeltaVisualPickDemo(Node):
 
         self.image_topic = str(self.get_parameter('image_topic').value)
         self.camera_info_topic = str(self.get_parameter('camera_info_topic').value)
+        self.depth_topic = str(self.get_parameter('depth_topic').value)
+        self.depth_camera_info_topic = str(self.get_parameter('depth_camera_info_topic').value)
         self.delta_move_topic = str(self.get_parameter('delta_move_topic').value)
         self.trigger_topic = str(self.get_parameter('trigger_topic').value)
         self.calibration_path = str(self.get_parameter('calibration_path').value)
         self.work_z_mm = float(self.get_parameter('work_z_mm').value)
+        self.use_depth = bool(self.get_parameter('use_depth').value)
+        self.depth_aligned_to_color = bool(self.get_parameter('depth_aligned_to_color').value)
+        self.depth_roi_px = int(self.get_parameter('depth_roi_px').value)
+        self.depth_min_m = float(self.get_parameter('depth_min_m').value)
+        self.depth_max_m = float(self.get_parameter('depth_max_m').value)
+        self.use_depth_for_z = bool(self.get_parameter('use_depth_for_z').value)
+        self.depth_z_offset_mm = float(self.get_parameter('depth_z_offset_mm').value)
         self.approach_z_mm = float(self.get_parameter('approach_z_mm').value)
         self.move_to_work_z = bool(self.get_parameter('move_to_work_z').value)
+        self.use_staged_motion = bool(self.get_parameter('use_staged_motion').value)
+        self.home_clear_x_mm = float(self.get_parameter('home_clear_x_mm').value)
+        self.home_clear_y_mm = float(self.get_parameter('home_clear_y_mm').value)
+        self.first_drop_z_mm = float(self.get_parameter('first_drop_z_mm').value)
+        self.xy_travel_z_mm = float(self.get_parameter('xy_travel_z_mm').value)
+        self.feedrate = float(self.get_parameter('feedrate').value)
         self.offset_mm = np.array(
             [
                 float(self.get_parameter('offset_x_mm').value),
@@ -91,6 +128,21 @@ class DeltaVisualPickDemo(Node):
             ],
             dtype=float,
         )
+        self.enforce_workspace_limits = bool(self.get_parameter('enforce_workspace_limits').value)
+        self.workspace_limits = {
+            'x': (
+                float(self.get_parameter('x_min_mm').value),
+                float(self.get_parameter('x_max_mm').value),
+            ),
+            'y': (
+                float(self.get_parameter('y_min_mm').value),
+                float(self.get_parameter('y_max_mm').value),
+            ),
+            'z': (
+                float(self.get_parameter('z_min_mm').value),
+                float(self.get_parameter('z_max_mm').value),
+            ),
+        }
         self.min_area_px = float(self.get_parameter('min_area_px').value)
         self.max_area_px = float(self.get_parameter('max_area_px').value)
         self.blur_kernel = int(self.get_parameter('blur_kernel').value)
@@ -104,6 +156,8 @@ class DeltaVisualPickDemo(Node):
         self.yolo_class_name = str(self.get_parameter('yolo_class_name').value).strip()
 
         self.camera_matrix = None
+        self.depth_camera_matrix = None
+        self.latest_depth = None
         self.latest_target = None
         self.latest_frame = None
         self.bridge = CvBridge()
@@ -117,20 +171,50 @@ class DeltaVisualPickDemo(Node):
             self.load_yolo_model()
 
         self.move_pub = self.create_publisher(Point, self.delta_move_topic, 10)
+        self.raw_gcode_pub = self.create_publisher(String, '/delta_arm/gcode_raw', 10)
         self.create_subscription(CameraInfo, self.camera_info_topic, self.on_camera_info, 10)
+        self.create_subscription(CameraInfo, self.depth_camera_info_topic, self.on_depth_camera_info, 10)
         self.create_subscription(Image, self.image_topic, self.on_image, 10)
+        self.create_subscription(Image, self.depth_topic, self.on_depth_image, 10)
         self.create_subscription(Empty, self.trigger_topic, self.on_trigger, 10)
         self.create_timer(0.03, self.on_timer)
         self.create_timer(1.0, self.on_status_timer)
 
         self.get_logger().info('Delta visual pick demo ready')
         self.get_logger().info(f'image: {self.image_topic}')
+        self.get_logger().info(f'depth: {self.depth_topic}, use_depth={self.use_depth}, aligned_to_color={self.depth_aligned_to_color}')
         self.get_logger().info(f'trigger: {self.trigger_topic}')
         self.get_logger().info(f'detector: {self.detector}')
         self.get_logger().info(f'calibration: {self.calibration_path}')
         self.get_logger().info(
-            'fixed plane: work_z=%.1f mm, approach_z=%.1f mm, offset=%s mm'
-            % (self.work_z_mm, self.approach_z_mm, np.round(self.offset_mm, 2).tolist())
+            'fixed plane/depth fallback: work_z=%.1f mm, approach_z=%.1f mm, offset=%s mm, use_depth_for_z=%s, depth_z_offset=%.1f mm'
+            % (
+                self.work_z_mm,
+                self.approach_z_mm,
+                np.round(self.offset_mm, 2).tolist(),
+                self.use_depth_for_z,
+                self.depth_z_offset_mm,
+            )
+        )
+        self.get_logger().info(
+            'motion: staged=%s, first_drop=(%.1f, %.1f, %.1f), xy_travel_z=%.1f, feedrate=%.1f'
+            % (
+                self.use_staged_motion,
+                self.home_clear_x_mm,
+                self.home_clear_y_mm,
+                self.first_drop_z_mm,
+                self.xy_travel_z_mm,
+                self.feedrate,
+            )
+        )
+        self.get_logger().info(
+            'workspace limits: x=%s y=%s z=%s, enforce=%s'
+            % (
+                self.workspace_limits['x'],
+                self.workspace_limits['y'],
+                self.workspace_limits['z'],
+                self.enforce_workspace_limits,
+            )
         )
         self.get_logger().info('keys: SPACE/m/ENTER send move, w write debug image, q quit')
 
@@ -147,6 +231,15 @@ class DeltaVisualPickDemo(Node):
 
     def on_camera_info(self, msg):
         self.camera_matrix = np.array(msg.k, dtype=float).reshape(3, 3)
+
+    def on_depth_camera_info(self, msg):
+        self.depth_camera_matrix = np.array(msg.k, dtype=float).reshape(3, 3)
+
+    def on_depth_image(self, msg):
+        try:
+            self.latest_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        except Exception as exc:
+            self.get_logger().warning(f'depth conversion failed: {exc}')
 
     def yellow_mask(self, bgr):
         kernel = self.blur_kernel if self.blur_kernel % 2 == 1 else self.blur_kernel + 1
@@ -194,6 +287,73 @@ class DeltaVisualPickDemo(Node):
         delta_xyz_mm = delta_xyz_m * 1000.0 + self.offset_mm
         return camera_xyz_m, delta_xyz_mm
 
+    def pixel_to_delta_with_depth(self, u, v, color_shape):
+        if self.latest_depth is None:
+            return None
+
+        depth = self.latest_depth
+        if depth.ndim != 2:
+            return None
+
+        depth_h, depth_w = depth.shape[:2]
+        color_h, color_w = color_shape[:2]
+        if depth_w <= 0 or depth_h <= 0 or color_w <= 0 or color_h <= 0:
+            return None
+
+        if self.depth_aligned_to_color:
+            du = int(round(u * depth_w / color_w))
+            dv = int(round(v * depth_h / color_h))
+            k = self.depth_camera_matrix if self.depth_camera_matrix is not None else self.camera_matrix
+        else:
+            du = int(round(u * depth_w / color_w))
+            dv = int(round(v * depth_h / color_h))
+            k = self.depth_camera_matrix
+
+        if k is None:
+            return None
+
+        roi = max(1, int(self.depth_roi_px))
+        if roi % 2 == 0:
+            roi += 1
+        half = roi // 2
+        x0 = max(0, du - half)
+        x1 = min(depth_w, du + half + 1)
+        y0 = max(0, dv - half)
+        y1 = min(depth_h, dv + half + 1)
+        patch = depth[y0:y1, x0:x1].astype(np.float32)
+        if patch.size == 0:
+            return None
+
+        if depth.dtype == np.uint16 or np.nanmax(patch) > 20.0:
+            patch_m = patch / 1000.0
+        else:
+            patch_m = patch
+
+        valid = patch_m[np.isfinite(patch_m)]
+        valid = valid[(valid >= self.depth_min_m) & (valid <= self.depth_max_m)]
+        if valid.size < max(3, roi):
+            return None
+
+        z = float(np.median(valid))
+        fx = k[0, 0]
+        fy = k[1, 1]
+        cx = k[0, 2]
+        cy = k[1, 2]
+        if fx == 0.0 or fy == 0.0:
+            return None
+
+        camera_xyz_m = np.array(
+            [
+                (du - cx) * z / fx,
+                (dv - cy) * z / fy,
+                z,
+            ],
+            dtype=float,
+        )
+        delta_xyz_m = self.r_delta_camera @ camera_xyz_m + self.t_delta_camera_vec
+        delta_xyz_mm = delta_xyz_m * 1000.0 + self.offset_mm
+        return camera_xyz_m, delta_xyz_mm, z, valid.size
+
     def detect_target(self, bgr):
         if self.detector == 'yolo':
             return self.detect_yolo_target(bgr)
@@ -213,10 +373,10 @@ class DeltaVisualPickDemo(Node):
                 continue
             u = float(moments['m10'] / moments['m00'])
             v = float(moments['m01'] / moments['m00'])
-            result = self.pixel_to_delta_on_plane(u, v)
+            result = self.pixel_to_delta_for_target(u, v, bgr.shape)
             if result is None:
                 continue
-            camera_xyz_m, delta_xyz_mm = result
+            camera_xyz_m, delta_xyz_mm, depth_info = result
             x, y, w, h = cv2.boundingRect(contour)
             return {
                 'u': u,
@@ -225,8 +385,29 @@ class DeltaVisualPickDemo(Node):
                 'bbox': (x, y, w, h),
                 'camera_xyz_m': camera_xyz_m,
                 'delta_xyz_mm': delta_xyz_mm,
+                'depth_info': depth_info,
             }, mask
         return None, mask
+
+    def pixel_to_delta_for_target(self, u, v, image_shape):
+        if self.use_depth:
+            depth_result = self.pixel_to_delta_with_depth(u, v, image_shape)
+            if depth_result is not None:
+                camera_xyz_m, delta_xyz_mm, depth_m, depth_count = depth_result
+                return camera_xyz_m, delta_xyz_mm, {
+                    'source': 'depth',
+                    'depth_m': depth_m,
+                    'count': depth_count,
+                }
+        plane_result = self.pixel_to_delta_on_plane(u, v)
+        if plane_result is None:
+            return None
+        camera_xyz_m, delta_xyz_mm = plane_result
+        return camera_xyz_m, delta_xyz_mm, {
+            'source': 'plane',
+            'depth_m': None,
+            'count': 0,
+        }
 
     def yolo_class_allowed(self, cls_id):
         if self.yolo_class_id >= 0 and cls_id != self.yolo_class_id:
@@ -277,10 +458,10 @@ class DeltaVisualPickDemo(Node):
         x1, y1, x2, y2 = best['xyxy']
         u = float((x1 + x2) * 0.5)
         v = float((y1 + y2) * 0.5)
-        result = self.pixel_to_delta_on_plane(u, v)
+        result = self.pixel_to_delta_for_target(u, v, bgr.shape)
         if result is None:
             return None, mask
-        camera_xyz_m, delta_xyz_mm = result
+        camera_xyz_m, delta_xyz_mm, depth_info = result
         names = getattr(self.yolo_model, 'names', {})
         label = str(names.get(best['cls_id'], best['cls_id']))
         return {
@@ -297,6 +478,7 @@ class DeltaVisualPickDemo(Node):
             'delta_xyz_mm': delta_xyz_mm,
             'label': label,
             'confidence': best['conf'],
+            'depth_info': depth_info,
         }, mask
 
     def on_image(self, msg):
@@ -354,7 +536,7 @@ class DeltaVisualPickDemo(Node):
             cv2.putText(
                 canvas,
                 'delta=(%.1f, %.1f, %.1f) mm'
-                % (delta[0], delta[1], self.command_z_mm(delta[2])),
+                % (delta[0], delta[1], self.command_z_mm(delta[2], target)),
                 (20, 105),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -362,6 +544,17 @@ class DeltaVisualPickDemo(Node):
                 2,
                 cv2.LINE_AA,
             )
+            if not self.point_in_workspace(delta[0], delta[1], self.command_z_mm(delta[2], target)):
+                cv2.putText(
+                    canvas,
+                    'OUT OF WORKSPACE - move rejected',
+                    (20, 135),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
         small_mask = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         small_mask = cv2.resize(small_mask, (canvas.shape[1] // 4, canvas.shape[0] // 4))
@@ -378,9 +571,17 @@ class DeltaVisualPickDemo(Node):
         )
         if 'label' in target:
             text += ' %s %.2f' % (target['label'], target.get('confidence', 0.0))
+        depth_info = target.get('depth_info') or {}
+        if depth_info.get('source') == 'depth':
+            text += ' depth=%.3fm' % depth_info.get('depth_m', 0.0)
+        elif depth_info.get('source') == 'plane':
+            text += ' planeZ'
         return text
 
-    def command_z_mm(self, transformed_z_mm):
+    def command_z_mm(self, transformed_z_mm, target=None):
+        depth_info = (target or {}).get('depth_info') or {}
+        if self.use_depth_for_z and depth_info.get('source') == 'depth':
+            return float(transformed_z_mm) + self.depth_z_offset_mm
         if self.move_to_work_z:
             return transformed_z_mm
         return self.approach_z_mm
@@ -390,14 +591,81 @@ class DeltaVisualPickDemo(Node):
             self.get_logger().warning('no target to move to')
             return
         delta = self.latest_target['delta_xyz_mm']
+        command_z = self.command_z_mm(delta[2], self.latest_target)
+        if not self.point_in_workspace(delta[0], delta[1], command_z):
+            self.get_logger().error(
+                'move rejected: target outside workspace x=%.1f y=%.1f z=%.1f mm, limits x=%s y=%s z=%s'
+                % (
+                    delta[0],
+                    delta[1],
+                    command_z,
+                    self.workspace_limits['x'],
+                    self.workspace_limits['y'],
+                    self.workspace_limits['z'],
+                )
+            )
+            return
+
+        if self.use_staged_motion:
+            self.send_staged_move(float(delta[0]), float(delta[1]), float(command_z))
+            return
+
         msg = Point()
         msg.x = float(delta[0])
         msg.y = float(delta[1])
-        msg.z = float(self.command_z_mm(delta[2]))
+        msg.z = float(command_z)
         self.move_pub.publish(msg)
         self.get_logger().info(
             'sent demo move: x=%.1f y=%.1f z=%.1f mm'
             % (msg.x, msg.y, msg.z)
+        )
+
+    def send_staged_move(self, x_mm, y_mm, z_mm):
+        staged_points = [
+            (self.home_clear_x_mm, self.home_clear_y_mm, self.first_drop_z_mm),
+            (x_mm, y_mm, self.xy_travel_z_mm),
+            (x_mm, y_mm, z_mm),
+        ]
+        for px, py, pz in staged_points:
+            if not self.point_in_workspace(px, py, pz):
+                self.get_logger().error(
+                    'staged move rejected: waypoint outside workspace x=%.1f y=%.1f z=%.1f mm'
+                    % (px, py, pz)
+                )
+                return
+
+        lines = ['G90']
+        for px, py, pz in staged_points:
+            lines.append('G1 X%.2f Y%.2f Z%.2f F%.2f' % (px, py, pz, self.feedrate))
+
+        msg = String()
+        msg.data = '\n'.join(lines)
+        self.raw_gcode_pub.publish(msg)
+        self.get_logger().info(
+            'sent staged move: drop=(%.1f, %.1f, %.1f) -> xy=(%.1f, %.1f, %.1f) -> final=(%.1f, %.1f, %.1f)'
+            % (
+                self.home_clear_x_mm,
+                self.home_clear_y_mm,
+                self.first_drop_z_mm,
+                x_mm,
+                y_mm,
+                self.xy_travel_z_mm,
+                x_mm,
+                y_mm,
+                z_mm,
+            )
+        )
+
+    def point_in_workspace(self, x_mm, y_mm, z_mm):
+        if not self.enforce_workspace_limits:
+            return True
+        x_low, x_high = self.workspace_limits['x']
+        y_low, y_high = self.workspace_limits['y']
+        z_low, z_high = self.workspace_limits['z']
+        return (
+            x_low <= float(x_mm) <= x_high
+            and y_low <= float(y_mm) <= y_high
+            and z_low <= float(z_mm) <= z_high
         )
 
     def on_status_timer(self):
@@ -417,7 +685,7 @@ class DeltaVisualPickDemo(Node):
                 self.target_summary_text(self.latest_target),
                 delta[0],
                 delta[1],
-                self.command_z_mm(delta[2]),
+                self.command_z_mm(delta[2], self.latest_target),
             )
         )
 
