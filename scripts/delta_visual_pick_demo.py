@@ -6,6 +6,7 @@ import select
 import sys
 import termios
 import tty
+from collections import deque
 
 import cv2
 import numpy as np
@@ -36,6 +37,16 @@ def load_transform(path):
     return transform
 
 
+def parse_float_list(text):
+    values = []
+    for item in str(text).replace(';', ',').split(','):
+        item = item.strip()
+        if not item:
+            continue
+        values.append(float(item))
+    return values
+
+
 class DeltaVisualPickDemo(Node):
     def __init__(self):
         super().__init__('delta_visual_pick_demo')
@@ -50,13 +61,29 @@ class DeltaVisualPickDemo(Node):
             'calibration_path',
             '/home/whr/cc_ws/tros_ws/calibration_targets/delta_hand_eye_filtered.yaml',
         )
+        self.declare_parameter('use_layered_calibration', False)
+        self.declare_parameter('layered_calibration_dir', '/home/whr/cc_ws/tros_ws/calibration_targets')
+        self.declare_parameter('layered_calibration_prefix', 'delta_hand_eye_center_z')
+        self.declare_parameter('layered_calibration_zs_mm', '-180,-190,-200,-210,-220,-230')
+        self.declare_parameter('calibration_select_z_mm', float('nan'))
         self.declare_parameter('work_z_mm', -170.0)
         self.declare_parameter('use_depth', False)
         self.declare_parameter('depth_aligned_to_color', True)
         self.declare_parameter('depth_roi_px', 9)
+        self.declare_parameter('depth_sample_mode', 'bbox_near')
+        self.declare_parameter('depth_bbox_shrink', 0.25)
+        self.declare_parameter('depth_percentile', 20.0)
+        self.declare_parameter('depth_temporal_window', 5)
+        self.declare_parameter('depth_temporal_max_pixel_jump', 20.0)
         self.declare_parameter('depth_min_m', 0.12)
         self.declare_parameter('depth_max_m', 1.20)
         self.declare_parameter('use_depth_for_z', False)
+        self.declare_parameter('use_depth_for_layer', False)
+        self.declare_parameter('depth_z_mapping', 'transform')
+        self.declare_parameter('depth_near_m', 0.25)
+        self.declare_parameter('depth_near_z_mm', -170.0)
+        self.declare_parameter('depth_far_m', 0.35)
+        self.declare_parameter('depth_far_z_mm', -230.0)
         self.declare_parameter('depth_z_offset_mm', 0.0)
         self.declare_parameter('approach_z_mm', -155.0)
         self.declare_parameter('move_to_work_z', False)
@@ -104,13 +131,29 @@ class DeltaVisualPickDemo(Node):
         self.delta_move_topic = str(self.get_parameter('delta_move_topic').value)
         self.trigger_topic = str(self.get_parameter('trigger_topic').value)
         self.calibration_path = str(self.get_parameter('calibration_path').value)
+        self.use_layered_calibration = bool(self.get_parameter('use_layered_calibration').value)
+        self.layered_calibration_dir = str(self.get_parameter('layered_calibration_dir').value)
+        self.layered_calibration_prefix = str(self.get_parameter('layered_calibration_prefix').value)
+        self.layered_calibration_zs_mm = parse_float_list(self.get_parameter('layered_calibration_zs_mm').value)
+        self.calibration_select_z_mm = float(self.get_parameter('calibration_select_z_mm').value)
         self.work_z_mm = float(self.get_parameter('work_z_mm').value)
         self.use_depth = bool(self.get_parameter('use_depth').value)
         self.depth_aligned_to_color = bool(self.get_parameter('depth_aligned_to_color').value)
         self.depth_roi_px = int(self.get_parameter('depth_roi_px').value)
+        self.depth_sample_mode = str(self.get_parameter('depth_sample_mode').value).lower().strip()
+        self.depth_bbox_shrink = float(self.get_parameter('depth_bbox_shrink').value)
+        self.depth_percentile = float(self.get_parameter('depth_percentile').value)
+        self.depth_temporal_window = int(self.get_parameter('depth_temporal_window').value)
+        self.depth_temporal_max_pixel_jump = float(self.get_parameter('depth_temporal_max_pixel_jump').value)
         self.depth_min_m = float(self.get_parameter('depth_min_m').value)
         self.depth_max_m = float(self.get_parameter('depth_max_m').value)
         self.use_depth_for_z = bool(self.get_parameter('use_depth_for_z').value)
+        self.use_depth_for_layer = bool(self.get_parameter('use_depth_for_layer').value)
+        self.depth_z_mapping = str(self.get_parameter('depth_z_mapping').value).lower().strip()
+        self.depth_near_m = float(self.get_parameter('depth_near_m').value)
+        self.depth_near_z_mm = float(self.get_parameter('depth_near_z_mm').value)
+        self.depth_far_m = float(self.get_parameter('depth_far_m').value)
+        self.depth_far_z_mm = float(self.get_parameter('depth_far_z_mm').value)
         self.depth_z_offset_mm = float(self.get_parameter('depth_z_offset_mm').value)
         self.approach_z_mm = float(self.get_parameter('approach_z_mm').value)
         self.move_to_work_z = bool(self.get_parameter('move_to_work_z').value)
@@ -162,6 +205,11 @@ class DeltaVisualPickDemo(Node):
         self.latest_frame = None
         self.bridge = CvBridge()
         self.yolo_model = None
+        self.depth_history = deque(maxlen=max(1, self.depth_temporal_window))
+
+        self.layered_transforms = {}
+        if self.use_layered_calibration:
+            self.load_layered_calibrations()
 
         self.t_delta_camera = load_transform(self.calibration_path)
         self.r_delta_camera = self.t_delta_camera[:3, :3]
@@ -186,14 +234,40 @@ class DeltaVisualPickDemo(Node):
         self.get_logger().info(f'trigger: {self.trigger_topic}')
         self.get_logger().info(f'detector: {self.detector}')
         self.get_logger().info(f'calibration: {self.calibration_path}')
+        if self.use_layered_calibration:
+            self.get_logger().info(
+                'layered calibration: enabled, layers=%s, select_z=%.1f mm'
+                % (sorted(self.layered_transforms.keys()), self.calibration_z_for_target())
+            )
         self.get_logger().info(
-            'fixed plane/depth fallback: work_z=%.1f mm, approach_z=%.1f mm, offset=%s mm, use_depth_for_z=%s, depth_z_offset=%.1f mm'
+                'fixed plane/depth fallback: work_z=%.1f mm, approach_z=%.1f mm, offset=%s mm, use_depth_for_z=%s, use_depth_for_layer=%s, depth_z_offset=%.1f mm'
             % (
                 self.work_z_mm,
                 self.approach_z_mm,
                 np.round(self.offset_mm, 2).tolist(),
                 self.use_depth_for_z,
+                self.use_depth_for_layer,
                 self.depth_z_offset_mm,
+            )
+        )
+        self.get_logger().info(
+            'depth sampling: mode=%s, roi=%d px, bbox_shrink=%.2f, percentile=%.1f, temporal_window=%d'
+            % (
+                self.depth_sample_mode,
+                self.depth_roi_px,
+                self.depth_bbox_shrink,
+                self.depth_percentile,
+                self.depth_temporal_window,
+            )
+        )
+        self.get_logger().info(
+            'depth z mapping: %s, near %.3fm -> %.1fmm, far %.3fm -> %.1fmm'
+            % (
+                self.depth_z_mapping,
+                self.depth_near_m,
+                self.depth_near_z_mm,
+                self.depth_far_m,
+                self.depth_far_z_mm,
             )
         )
         self.get_logger().info(
@@ -217,6 +291,65 @@ class DeltaVisualPickDemo(Node):
             )
         )
         self.get_logger().info('keys: SPACE/m/ENTER send move, w write debug image, q quit')
+
+    def load_layered_calibrations(self):
+        if not self.layered_calibration_zs_mm:
+            raise RuntimeError('use_layered_calibration is true, but layered_calibration_zs_mm is empty')
+
+        loaded = {}
+        for z_mm in self.layered_calibration_zs_mm:
+            z_key = int(round(abs(z_mm)))
+            path = f'{self.layered_calibration_dir.rstrip("/")}/{self.layered_calibration_prefix}{z_key}.yaml'
+            transform = load_transform(path)
+            loaded[float(z_mm)] = transform
+
+        self.layered_transforms = loaded
+
+    def calibration_z_for_target(self):
+        if math.isfinite(self.calibration_select_z_mm):
+            return self.calibration_select_z_mm
+        return self.work_z_mm
+
+    def transform_for_target(self):
+        if not self.use_layered_calibration or not self.layered_transforms:
+            return self.r_delta_camera, self.t_delta_camera_vec, None
+
+        select_z = self.calibration_z_for_target()
+        layer_z = min(self.layered_transforms.keys(), key=lambda z: abs(z - select_z))
+        transform = self.layered_transforms[layer_z]
+        return transform[:3, :3], transform[:3, 3], layer_z
+
+    def raw_depth_to_delta_z_mm(self, depth_m):
+        near_m = self.depth_near_m
+        far_m = self.depth_far_m
+        if abs(far_m - near_m) < 1e-9:
+            return self.depth_near_z_mm + self.depth_z_offset_mm
+
+        ratio = (float(depth_m) - near_m) / (far_m - near_m)
+        ratio = clamp(ratio, 0.0, 1.0)
+        z_mm = self.depth_near_z_mm + ratio * (self.depth_far_z_mm - self.depth_near_z_mm)
+        return z_mm + self.depth_z_offset_mm
+
+    def transform_for_depth_point(self, camera_xyz_m, depth_m=None):
+        if not self.use_layered_calibration or not self.layered_transforms or not self.use_depth_for_layer:
+            return self.transform_for_target()
+
+        if self.depth_z_mapping == 'raw_linear' and depth_m is not None:
+            target_z = self.raw_depth_to_delta_z_mm(depth_m)
+            layer_z = min(self.layered_transforms.keys(), key=lambda z: abs(z - target_z))
+            transform = self.layered_transforms[layer_z]
+            return transform[:3, :3], transform[:3, 3], layer_z
+
+        best = None
+        for layer_z, transform in self.layered_transforms.items():
+            delta_xyz_m = transform[:3, :3] @ camera_xyz_m + transform[:3, 3]
+            delta_z_mm = delta_xyz_m[2] * 1000.0 + self.offset_mm[2] + self.depth_z_offset_mm
+            error = abs(delta_z_mm - layer_z)
+            if best is None or error < best[0]:
+                best = (error, layer_z, transform)
+
+        _, layer_z, transform = best
+        return transform[:3, :3], transform[:3, 3], layer_z
 
     def on_trigger(self, _msg):
         self.send_latest_move()
@@ -273,21 +406,89 @@ class DeltaVisualPickDemo(Node):
             return None
 
         ray_camera = np.array([(u - cx) / fx, (v - cy) / fy, 1.0], dtype=float)
-        denominator = float(self.r_delta_camera[2, :] @ ray_camera)
+        r_delta_camera, t_delta_camera_vec, layer_z = self.transform_for_target()
+        denominator = float(r_delta_camera[2, :] @ ray_camera)
         if abs(denominator) < 1e-6:
             return None
 
         work_z_m = self.work_z_mm / 1000.0
-        scale = (work_z_m - self.t_delta_camera_vec[2]) / denominator
+        scale = (work_z_m - t_delta_camera_vec[2]) / denominator
         if not math.isfinite(scale) or scale <= 0.0:
             return None
 
         camera_xyz_m = ray_camera * scale
-        delta_xyz_m = self.r_delta_camera @ camera_xyz_m + self.t_delta_camera_vec
+        delta_xyz_m = r_delta_camera @ camera_xyz_m + t_delta_camera_vec
         delta_xyz_mm = delta_xyz_m * 1000.0 + self.offset_mm
-        return camera_xyz_m, delta_xyz_mm
+        return camera_xyz_m, delta_xyz_mm, layer_z
 
-    def pixel_to_delta_with_depth(self, u, v, color_shape):
+    def depth_box_from_target(self, u, v, color_shape, bbox=None):
+        depth_h, depth_w = self.latest_depth.shape[:2]
+        color_h, color_w = color_shape[:2]
+
+        du = int(round(u * depth_w / color_w))
+        dv = int(round(v * depth_h / color_h))
+
+        mode = self.depth_sample_mode
+        if bbox is not None and mode.startswith('bbox'):
+            x, y, w, h = bbox
+            shrink = clamp(self.depth_bbox_shrink, 0.0, 0.8)
+            x0_color = x + w * shrink * 0.5
+            x1_color = x + w * (1.0 - shrink * 0.5)
+            y0_color = y + h * shrink * 0.5
+            y1_color = y + h * (1.0 - shrink * 0.5)
+
+            x0 = int(math.floor(x0_color * depth_w / color_w))
+            x1 = int(math.ceil(x1_color * depth_w / color_w))
+            y0 = int(math.floor(y0_color * depth_h / color_h))
+            y1 = int(math.ceil(y1_color * depth_h / color_h))
+            x0 = clamp(x0, 0, depth_w - 1)
+            x1 = clamp(x1, x0 + 1, depth_w)
+            y0 = clamp(y0, 0, depth_h - 1)
+            y1 = clamp(y1, y0 + 1, depth_h)
+            return int(du), int(dv), int(x0), int(x1), int(y0), int(y1)
+
+        roi = max(1, int(self.depth_roi_px))
+        if roi % 2 == 0:
+            roi += 1
+        half = roi // 2
+        x0 = max(0, du - half)
+        x1 = min(depth_w, du + half + 1)
+        y0 = max(0, dv - half)
+        y1 = min(depth_h, dv + half + 1)
+        return int(du), int(dv), int(x0), int(x1), int(y0), int(y1)
+
+    def choose_depth_value(self, valid):
+        mode = self.depth_sample_mode
+        if mode in ('mean', 'bbox_mean'):
+            return float(np.mean(valid))
+        if mode in ('bbox_near_mean', 'near_mean'):
+            percentile = clamp(self.depth_percentile, 0.0, 100.0)
+            threshold = float(np.percentile(valid, percentile))
+            near = valid[valid <= threshold]
+            if near.size >= 3:
+                return float(np.mean(near))
+            return threshold
+        if mode in ('bbox_near', 'near', 'percentile'):
+            percentile = clamp(self.depth_percentile, 0.0, 100.0)
+            return float(np.percentile(valid, percentile))
+        return float(np.median(valid))
+
+    def smooth_depth_value(self, du, dv, z):
+        if self.depth_temporal_window <= 1:
+            self.depth_history.clear()
+            return z, z, 1
+
+        if self.depth_history:
+            last_u, last_v, _last_z = self.depth_history[-1]
+            jump = math.hypot(float(du) - last_u, float(dv) - last_v)
+            if jump > self.depth_temporal_max_pixel_jump:
+                self.depth_history.clear()
+
+        self.depth_history.append((float(du), float(dv), float(z)))
+        values = np.array([item[2] for item in self.depth_history], dtype=float)
+        return float(np.mean(values)), z, int(values.size)
+
+    def pixel_to_delta_with_depth(self, u, v, color_shape, bbox=None):
         if self.latest_depth is None:
             return None
 
@@ -300,26 +501,14 @@ class DeltaVisualPickDemo(Node):
         if depth_w <= 0 or depth_h <= 0 or color_w <= 0 or color_h <= 0:
             return None
 
-        if self.depth_aligned_to_color:
-            du = int(round(u * depth_w / color_w))
-            dv = int(round(v * depth_h / color_h))
-            k = self.depth_camera_matrix if self.depth_camera_matrix is not None else self.camera_matrix
-        else:
-            du = int(round(u * depth_w / color_w))
-            dv = int(round(v * depth_h / color_h))
+        k = self.depth_camera_matrix if self.depth_camera_matrix is not None else self.camera_matrix
+        if not self.depth_aligned_to_color:
             k = self.depth_camera_matrix
 
         if k is None:
             return None
 
-        roi = max(1, int(self.depth_roi_px))
-        if roi % 2 == 0:
-            roi += 1
-        half = roi // 2
-        x0 = max(0, du - half)
-        x1 = min(depth_w, du + half + 1)
-        y0 = max(0, dv - half)
-        y1 = min(depth_h, dv + half + 1)
+        du, dv, x0, x1, y0, y1 = self.depth_box_from_target(u, v, color_shape, bbox)
         patch = depth[y0:y1, x0:x1].astype(np.float32)
         if patch.size == 0:
             return None
@@ -331,10 +520,12 @@ class DeltaVisualPickDemo(Node):
 
         valid = patch_m[np.isfinite(patch_m)]
         valid = valid[(valid >= self.depth_min_m) & (valid <= self.depth_max_m)]
-        if valid.size < max(3, roi):
+        min_valid = max(3, min(int(self.depth_roi_px), 30))
+        if valid.size < min_valid:
             return None
 
-        z = float(np.median(valid))
+        raw_z = self.choose_depth_value(valid)
+        z, raw_z, temporal_count = self.smooth_depth_value(du, dv, raw_z)
         fx = k[0, 0]
         fy = k[1, 1]
         cx = k[0, 2]
@@ -350,9 +541,22 @@ class DeltaVisualPickDemo(Node):
             ],
             dtype=float,
         )
-        delta_xyz_m = self.r_delta_camera @ camera_xyz_m + self.t_delta_camera_vec
+        r_delta_camera, t_delta_camera_vec, layer_z = self.transform_for_depth_point(camera_xyz_m, z)
+        delta_xyz_m = r_delta_camera @ camera_xyz_m + t_delta_camera_vec
         delta_xyz_mm = delta_xyz_m * 1000.0 + self.offset_mm
-        return camera_xyz_m, delta_xyz_mm, z, valid.size
+        stats = {
+            'count': int(valid.size),
+            'temporal_count': int(temporal_count),
+            'raw_m': float(raw_z),
+            'smooth_m': float(z),
+            'min_m': float(np.min(valid)),
+            'median_m': float(np.median(valid)),
+            'mean_m': float(np.mean(valid)),
+            'max_m': float(np.max(valid)),
+            'box': (int(x0), int(y0), int(x1 - x0), int(y1 - y0)),
+            'sample_mode': self.depth_sample_mode,
+        }
+        return camera_xyz_m, delta_xyz_mm, z, stats, layer_z
 
     def detect_target(self, bgr):
         if self.detector == 'yolo':
@@ -373,11 +577,11 @@ class DeltaVisualPickDemo(Node):
                 continue
             u = float(moments['m10'] / moments['m00'])
             v = float(moments['m01'] / moments['m00'])
-            result = self.pixel_to_delta_for_target(u, v, bgr.shape)
+            x, y, w, h = cv2.boundingRect(contour)
+            result = self.pixel_to_delta_for_target(u, v, bgr.shape, (x, y, w, h))
             if result is None:
                 continue
             camera_xyz_m, delta_xyz_mm, depth_info = result
-            x, y, w, h = cv2.boundingRect(contour)
             return {
                 'u': u,
                 'v': v,
@@ -389,24 +593,27 @@ class DeltaVisualPickDemo(Node):
             }, mask
         return None, mask
 
-    def pixel_to_delta_for_target(self, u, v, image_shape):
+    def pixel_to_delta_for_target(self, u, v, image_shape, bbox=None):
         if self.use_depth:
-            depth_result = self.pixel_to_delta_with_depth(u, v, image_shape)
+            depth_result = self.pixel_to_delta_with_depth(u, v, image_shape, bbox)
             if depth_result is not None:
-                camera_xyz_m, delta_xyz_mm, depth_m, depth_count = depth_result
+                camera_xyz_m, delta_xyz_mm, depth_m, depth_stats, layer_z = depth_result
                 return camera_xyz_m, delta_xyz_mm, {
                     'source': 'depth',
                     'depth_m': depth_m,
-                    'count': depth_count,
+                    'count': depth_stats['count'],
+                    'stats': depth_stats,
+                    'layer_z_mm': layer_z,
                 }
         plane_result = self.pixel_to_delta_on_plane(u, v)
         if plane_result is None:
             return None
-        camera_xyz_m, delta_xyz_mm = plane_result
+        camera_xyz_m, delta_xyz_mm, layer_z = plane_result
         return camera_xyz_m, delta_xyz_mm, {
             'source': 'plane',
             'depth_m': None,
             'count': 0,
+            'layer_z_mm': layer_z,
         }
 
     def yolo_class_allowed(self, cls_id):
@@ -458,7 +665,13 @@ class DeltaVisualPickDemo(Node):
         x1, y1, x2, y2 = best['xyxy']
         u = float((x1 + x2) * 0.5)
         v = float((y1 + y2) * 0.5)
-        result = self.pixel_to_delta_for_target(u, v, bgr.shape)
+        bbox = (
+            int(round(x1)),
+            int(round(y1)),
+            int(round(x2 - x1)),
+            int(round(y2 - y1)),
+        )
+        result = self.pixel_to_delta_for_target(u, v, bgr.shape, bbox)
         if result is None:
             return None, mask
         camera_xyz_m, delta_xyz_mm, depth_info = result
@@ -468,12 +681,7 @@ class DeltaVisualPickDemo(Node):
             'u': u,
             'v': v,
             'area': best['area'],
-            'bbox': (
-                int(round(x1)),
-                int(round(y1)),
-                int(round(x2 - x1)),
-                int(round(y2 - y1)),
-            ),
+            'bbox': bbox,
             'camera_xyz_m': camera_xyz_m,
             'delta_xyz_mm': delta_xyz_mm,
             'label': label,
@@ -513,42 +721,12 @@ class DeltaVisualPickDemo(Node):
             delta = target['delta_xyz_mm']
             cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 255, 255), 2)
             cv2.drawMarker(canvas, (u, v), (0, 0, 255), cv2.MARKER_CROSS, 24, 2)
-            cv2.putText(
-                canvas,
-                'READY: press SPACE to move',
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 180, 0),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                canvas,
-                self.target_summary_text(target),
-                (20, 75),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                canvas,
-                'delta=(%.1f, %.1f, %.1f) mm'
-                % (delta[0], delta[1], self.command_z_mm(delta[2], target)),
-                (20, 105),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
+            self.draw_text_panel(canvas, self.overlay_lines(target), (12, 12))
             if not self.point_in_workspace(delta[0], delta[1], self.command_z_mm(delta[2], target)):
                 cv2.putText(
                     canvas,
                     'OUT OF WORKSPACE - move rejected',
-                    (20, 135),
+                    (20, 215),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.65,
                     (0, 0, 255),
@@ -563,6 +741,105 @@ class DeltaVisualPickDemo(Node):
         canvas[y0:y0 + small_mask.shape[0], x0:x0 + small_mask.shape[1]] = small_mask
         return canvas
 
+    def draw_text_panel(self, canvas, lines, origin):
+        x, y = origin
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.58
+        thickness = 1
+        line_h = 23
+        widths = []
+        for line in lines:
+            (text_w, _text_h), _baseline = cv2.getTextSize(line, font, scale, thickness)
+            widths.append(text_w)
+        panel_w = min(canvas.shape[1] - x - 8, max(widths, default=0) + 22)
+        panel_h = line_h * len(lines) + 15
+
+        overlay = canvas.copy()
+        cv2.rectangle(
+            overlay,
+            (x, y),
+            (x + panel_w, y + panel_h),
+            (20, 20, 20),
+            -1,
+        )
+        cv2.addWeighted(overlay, 0.72, canvas, 0.28, 0, canvas)
+        cv2.rectangle(canvas, (x, y), (x + panel_w, y + panel_h), (80, 80, 80), 1)
+
+        for idx, line in enumerate(lines):
+            color = (0, 220, 0) if idx == 0 else (255, 255, 255)
+            cv2.putText(
+                canvas,
+                line,
+                (x + 10, y + 24 + idx * line_h),
+                font,
+                scale,
+                color,
+                thickness,
+                cv2.LINE_AA,
+            )
+
+    def overlay_lines(self, target):
+        delta = target['delta_xyz_mm']
+        command_z = self.command_z_mm(delta[2], target)
+        depth_info = target.get('depth_info') or {}
+        stats = depth_info.get('stats') or {}
+        label = target.get('label', 'target')
+        confidence = target.get('confidence', 0.0)
+        layer_z = depth_info.get('layer_z_mm')
+        source = depth_info.get('source', 'none')
+
+        lines = [
+            'READY  %s %.2f  pixel=(%.0f, %.0f) area=%.0f'
+            % (label, confidence, target['u'], target['v'], target['area']),
+            'cmd xyz=(%.1f, %.1f, %.1f) mm'
+            % (delta[0], delta[1], command_z),
+            'transform_z=%.1f mm  cmd_z=%.1f mm'
+            % (delta[2], command_z),
+            'source=%s  calibZ=%s  mode=%s  zmap=%s'
+            % (
+                source,
+                'none' if layer_z is None else '%.0f' % layer_z,
+                self.depth_sample_mode,
+                self.depth_z_mapping,
+            ),
+        ]
+
+        if source == 'depth':
+            lines.append(
+                'depth smooth=%.3f m  raw=%.3f m  temporal=%d'
+                % (
+                    depth_info.get('depth_m', 0.0),
+                    stats.get('raw_m', 0.0),
+                    stats.get('temporal_count', 0),
+                )
+            )
+            lines.append(
+                'patch min/mean/med/max=%.3f/%.3f/%.3f/%.3f m  n=%d'
+                % (
+                    stats.get('min_m', 0.0),
+                    stats.get('mean_m', 0.0),
+                    stats.get('median_m', 0.0),
+                    stats.get('max_m', 0.0),
+                    stats.get('count', 0),
+                )
+            )
+        else:
+            lines.append('depth unavailable, using fixed plane/work_z')
+
+        lines.append(
+            'offset=(%.1f, %.1f, %.1f)  rawZ %.3fm->%.0f %.3fm->%.0f'
+            % (
+                self.offset_mm[0],
+                self.offset_mm[1],
+                self.offset_mm[2],
+                self.depth_near_m,
+                self.depth_near_z_mm + self.depth_z_offset_mm,
+                self.depth_far_m,
+                self.depth_far_z_mm + self.depth_z_offset_mm,
+            )
+        )
+        return lines
+
     def target_summary_text(self, target):
         text = 'pixel=(%.0f, %.0f) area=%.0f' % (
             target['u'],
@@ -574,13 +851,27 @@ class DeltaVisualPickDemo(Node):
         depth_info = target.get('depth_info') or {}
         if depth_info.get('source') == 'depth':
             text += ' depth=%.3fm' % depth_info.get('depth_m', 0.0)
+            stats = depth_info.get('stats') or {}
+            if stats:
+                text += ' raw=%.3f d=[%.3f,%.3f,%.3f] n=%d/%d' % (
+                    stats.get('raw_m', 0.0),
+                    stats.get('min_m', 0.0),
+                    stats.get('median_m', 0.0),
+                    stats.get('max_m', 0.0),
+                    stats.get('count', 0),
+                    stats.get('temporal_count', 0),
+                )
         elif depth_info.get('source') == 'plane':
             text += ' planeZ'
+        if depth_info.get('layer_z_mm') is not None:
+            text += ' calibZ=%.0f' % depth_info.get('layer_z_mm')
         return text
 
     def command_z_mm(self, transformed_z_mm, target=None):
         depth_info = (target or {}).get('depth_info') or {}
         if self.use_depth_for_z and depth_info.get('source') == 'depth':
+            if self.depth_z_mapping == 'raw_linear':
+                return self.raw_depth_to_delta_z_mm(depth_info.get('depth_m', 0.0))
             return float(transformed_z_mm) + self.depth_z_offset_mm
         if self.move_to_work_z:
             return transformed_z_mm

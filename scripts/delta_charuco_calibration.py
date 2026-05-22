@@ -19,7 +19,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Point, PointStamped, PoseStamped
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Empty
+from std_msgs.msg import Empty, String
 
 
 def make_transform(r_mat, t_vec):
@@ -69,6 +69,8 @@ class DeltaCharucoCalibration(Node):
         self.declare_parameter('delta_home_topic', '/delta_arm/home')
         self.declare_parameter('save_path', '/home/whr/cc_ws/tros_ws/calibration_targets/delta_hand_eye.yaml')
         self.declare_parameter('validation_path', '/home/whr/cc_ws/tros_ws/calibration_targets/delta_hand_eye_filtered.yaml')
+        self.declare_parameter('waypoint_path', '/home/whr/cc_ws/tros_ws/calibration_targets/delta_calibration_waypoints.yaml')
+        self.declare_parameter('boundary_path', '/home/whr/cc_ws/tros_ws/calibration_targets/delta_workspace_slices.yaml')
         self.declare_parameter('debug_image_path', '/tmp/delta_charuco_debug.png')
         self.declare_parameter('squares_x', 6)
         self.declare_parameter('squares_y', 5)
@@ -77,6 +79,17 @@ class DeltaCharucoCalibration(Node):
         self.declare_parameter('dictionary', 'DICT_4X4_50')
         self.declare_parameter('min_charuco_corners', 8)
         self.declare_parameter('status_period_sec', 2.0)
+        self.declare_parameter('move_settle_sec', 2.0)
+        self.declare_parameter('use_staged_motion', False)
+        self.declare_parameter('travel_z_mm', -170.0)
+        self.declare_parameter('feedrate', 80.0)
+        self.declare_parameter('auto_start_index', 1)
+        self.declare_parameter('auto_end_index', 0)
+        self.declare_parameter('max_consecutive_skips', 3)
+        self.declare_parameter('post_move_detect_timeout_sec', 5.0)
+        self.declare_parameter('stable_detection_frames', 3)
+        self.declare_parameter('stable_detection_tolerance_mm', 3.0)
+        self.declare_parameter('grid_step_xy_mm', 20.0)
         self.declare_parameter('home_x_mm', 0.0)
         self.declare_parameter('home_y_mm', 0.0)
         self.declare_parameter('home_z_mm', -140.0)
@@ -86,6 +99,8 @@ class DeltaCharucoCalibration(Node):
         self.dist_coeffs = None
         self.latest_image = None
         self.latest_detection = None
+        self.image_seq = 0
+        self.latest_detection_seq = -1
         self.latest_detect_debug = {
             'markers': 0,
             'charuco_corners': 0,
@@ -94,6 +109,9 @@ class DeltaCharucoCalibration(Node):
         self.validation_transform = None
         self.validation_path_loaded = None
         self.samples = []
+        self.waypoints = []
+        self.current_waypoint_index = -1
+        self.boundary_layers = {}
         self.last_status_time = 0.0
 
         self.delta_xyz_mm = np.array([
@@ -140,6 +158,21 @@ class DeltaCharucoCalibration(Node):
             self.on_delta_home,
             10,
         )
+        self.delta_move_pub = self.create_publisher(
+            Point,
+            str(self.get_parameter('delta_move_topic').value),
+            10,
+        )
+        self.delta_home_pub = self.create_publisher(
+            Empty,
+            str(self.get_parameter('delta_home_topic').value),
+            10,
+        )
+        self.raw_gcode_pub = self.create_publisher(
+            String,
+            '/delta_arm/gcode_raw',
+            10,
+        )
 
         self.board_pose_pub = self.create_publisher(
             PoseStamped,
@@ -158,6 +191,8 @@ class DeltaCharucoCalibration(Node):
         )
 
         self.load_validation_transform()
+        self.load_waypoints(log_missing=False)
+        self.load_boundary_layers(log_missing=False)
         self.get_logger().info('Delta ChArUco calibration ready')
         self.print_help()
 
@@ -169,6 +204,18 @@ class DeltaCharucoCalibration(Node):
         print('  w: write debug image to disk')
         print('  l: list saved samples')
         print('  u: undo last sample')
+        print('  p: save current delta pose as a waypoint')
+        print('  y: list waypoints')
+        print('  o: write waypoints to disk')
+        print('  r: load waypoints from disk')
+        print('  n: move to next waypoint')
+        print('  b: move to previous waypoint')
+        print('  a: auto-run all waypoints and save samples')
+        print('  k: save current pose as boundary point for current Z layer')
+        print('  j: list boundary points for current Z layer')
+        print('  t: save boundary layers to disk')
+        print('  i: load boundary layers from disk')
+        print('  g: generate grid waypoints from current Z boundary layer')
         print('  q: quit')
         print('')
 
@@ -195,6 +242,389 @@ class DeltaCharucoCalibration(Node):
         except Exception as exc:
             self.get_logger().error(f'failed to load validation transform {path}: {exc}')
             return False
+
+    def waypoint_path(self):
+        return Path(os.path.expanduser(str(self.get_parameter('waypoint_path').value)))
+
+    def boundary_path(self):
+        return Path(os.path.expanduser(str(self.get_parameter('boundary_path').value)))
+
+    def move_settle_sec(self):
+        return float(self.get_parameter('move_settle_sec').value)
+
+    def use_staged_motion(self):
+        return bool(self.get_parameter('use_staged_motion').value)
+
+    def travel_z_mm(self):
+        return float(self.get_parameter('travel_z_mm').value)
+
+    def feedrate(self):
+        return float(self.get_parameter('feedrate').value)
+
+    def auto_start_index(self):
+        return max(1, int(self.get_parameter('auto_start_index').value))
+
+    def auto_end_index(self):
+        return int(self.get_parameter('auto_end_index').value)
+
+    def max_consecutive_skips(self):
+        return max(1, int(self.get_parameter('max_consecutive_skips').value))
+
+    def post_move_detect_timeout_sec(self):
+        return max(0.0, float(self.get_parameter('post_move_detect_timeout_sec').value))
+
+    def stable_detection_frames(self):
+        return max(1, int(self.get_parameter('stable_detection_frames').value))
+
+    def stable_detection_tolerance_mm(self):
+        return max(0.0, float(self.get_parameter('stable_detection_tolerance_mm').value))
+
+    def grid_step_xy_mm(self):
+        return float(self.get_parameter('grid_step_xy_mm').value)
+
+    @staticmethod
+    def z_layer_key(z_mm):
+        return int(round(float(z_mm)))
+
+    def load_waypoints(self, log_missing=True):
+        path = self.waypoint_path()
+        if not path.exists():
+            if log_missing:
+                self.get_logger().warning(f'waypoint file not found: {path}')
+            return False
+        try:
+            with path.open('r', encoding='utf-8') as file:
+                data = yaml.safe_load(file) or {}
+            loaded = data.get('waypoints', [])
+            self.waypoints = []
+            for item in loaded:
+                xyz = np.array(
+                    [
+                        float(item['x_mm']),
+                        float(item['y_mm']),
+                        float(item['z_mm']),
+                    ],
+                    dtype=float,
+                )
+                self.waypoints.append({
+                    'name': str(item.get('name', f'pt_{len(self.waypoints) + 1:02d}')),
+                    'xyz_mm': xyz,
+                })
+            self.current_waypoint_index = 0 if self.waypoints else -1
+            self.get_logger().info(f'loaded {len(self.waypoints)} waypoints from {path}')
+            return True
+        except Exception as exc:
+            self.get_logger().error(f'failed to load waypoints from {path}: {exc}')
+            return False
+
+    def save_waypoints(self):
+        path = self.waypoint_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            'description': 'Delta calibration waypoints in delta base frame (mm)',
+            'waypoints': [
+                {
+                    'name': waypoint['name'],
+                    'x_mm': float(waypoint['xyz_mm'][0]),
+                    'y_mm': float(waypoint['xyz_mm'][1]),
+                    'z_mm': float(waypoint['xyz_mm'][2]),
+                }
+                for waypoint in self.waypoints
+            ],
+        }
+        with path.open('w', encoding='utf-8') as file:
+            yaml.safe_dump(data, file, sort_keys=False, allow_unicode=True)
+        self.get_logger().info(f'saved {len(self.waypoints)} waypoints to {path}')
+
+    def load_boundary_layers(self, log_missing=True):
+        path = self.boundary_path()
+        if not path.exists():
+            if log_missing:
+                self.get_logger().warning(f'boundary layer file not found: {path}')
+            return False
+        try:
+            with path.open('r', encoding='utf-8') as file:
+                data = yaml.safe_load(file) or {}
+            self.boundary_layers = {}
+            for layer in data.get('layers', []):
+                z_key = self.z_layer_key(layer['z_mm'])
+                points = []
+                for item in layer.get('points', []):
+                    points.append(np.array([float(item[0]), float(item[1])], dtype=float))
+                self.boundary_layers[z_key] = points
+            self.get_logger().info(f'loaded {len(self.boundary_layers)} boundary layers from {path}')
+            return True
+        except Exception as exc:
+            self.get_logger().error(f'failed to load boundary layers from {path}: {exc}')
+            return False
+
+    def save_boundary_layers(self):
+        path = self.boundary_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        layers = []
+        for z_key in sorted(self.boundary_layers):
+            layers.append({
+                'z_mm': int(z_key),
+                'points': [
+                    [float(point[0]), float(point[1])]
+                    for point in self.boundary_layers[z_key]
+                ],
+            })
+        data = {
+            'description': 'Safe XY boundary points grouped by Z slice (mm)',
+            'layers': layers,
+        }
+        with path.open('w', encoding='utf-8') as file:
+            yaml.safe_dump(data, file, sort_keys=False, allow_unicode=True)
+        self.get_logger().info(f'saved {len(layers)} boundary layers to {path}')
+
+    def add_boundary_point_from_current_pose(self):
+        z_key = self.z_layer_key(self.delta_xyz_mm[2])
+        xy = self.delta_xyz_mm[:2].astype(float).copy()
+        self.boundary_layers.setdefault(z_key, []).append(xy)
+        self.get_logger().info(
+            'saved boundary point for z=%d mm: %s'
+            % (z_key, np.round(xy, 1).tolist())
+        )
+
+    def list_boundary_points(self):
+        z_key = self.z_layer_key(self.delta_xyz_mm[2])
+        points = self.boundary_layers.get(z_key, [])
+        if not points:
+            self.get_logger().info(f'no boundary points recorded for z={z_key} mm')
+            return
+        self.get_logger().info(f'boundary layer z={z_key} mm has {len(points)} points')
+        for index, point in enumerate(points, start=1):
+            self.get_logger().info(
+                '%02d xy_mm=%s'
+                % (index, np.round(point, 1).tolist())
+            )
+
+    @staticmethod
+    def convex_hull(points_xy):
+        pts = np.asarray(points_xy, dtype=np.float32).reshape(-1, 1, 2)
+        hull = cv2.convexHull(pts, clockwise=False)
+        return hull.reshape(-1, 2).astype(float)
+
+    def generate_grid_waypoints_from_current_layer(self):
+        z_key = self.z_layer_key(self.delta_xyz_mm[2])
+        points = self.boundary_layers.get(z_key, [])
+        if len(points) < 3:
+            self.get_logger().warning(
+                f'need at least 3 boundary points for z={z_key} mm, got {len(points)}'
+            )
+            return
+
+        hull = self.convex_hull(points)
+        hull_cv = hull.astype(np.float32).reshape(-1, 1, 2)
+        x_min = float(np.min(hull[:, 0]))
+        x_max = float(np.max(hull[:, 0]))
+        y_min = float(np.min(hull[:, 1]))
+        y_max = float(np.max(hull[:, 1]))
+        step = max(1.0, self.grid_step_xy_mm())
+
+        generated = []
+        y = y_min
+        row_index = 0
+        while y <= y_max + 1e-6:
+            xs = np.arange(x_min, x_max + 0.5 * step, step)
+            if row_index % 2 == 1:
+                xs = xs[::-1]
+            for x in xs:
+                inside = cv2.pointPolygonTest(hull_cv, (float(x), float(y)), False)
+                if inside >= 0.0:
+                    xyz = np.array([float(x), float(y), float(z_key)], dtype=float)
+                    generated.append({
+                        'name': f'z{z_key}_pt_{len(generated) + 1:02d}',
+                        'xyz_mm': xyz,
+                    })
+            y += step
+            row_index += 1
+
+        if not generated:
+            self.get_logger().warning(f'no grid waypoints generated for z={z_key} mm')
+            return
+
+        self.waypoints = [wp for wp in self.waypoints if self.z_layer_key(wp['xyz_mm'][2]) != z_key]
+        self.waypoints.extend(generated)
+        self.current_waypoint_index = 0 if self.waypoints else -1
+        self.get_logger().info(
+            'generated %d waypoints for z=%d mm using step %.1f mm'
+            % (len(generated), z_key, step)
+        )
+
+    def add_waypoint_from_current_pose(self):
+        xyz = self.delta_xyz_mm.astype(float).copy()
+        name = f'pt_{len(self.waypoints) + 1:02d}'
+        self.waypoints.append({
+            'name': name,
+            'xyz_mm': xyz,
+        })
+        self.current_waypoint_index = len(self.waypoints) - 1
+        self.get_logger().info(
+            'saved waypoint %s at %s mm'
+            % (name, np.round(xyz, 1).tolist())
+        )
+
+    def list_waypoints(self):
+        if not self.waypoints:
+            self.get_logger().info('no waypoints saved')
+            return
+        for index, waypoint in enumerate(self.waypoints, start=1):
+            marker = '*' if index - 1 == self.current_waypoint_index else ' '
+            self.get_logger().info(
+                '%s%02d %s delta_mm=%s'
+                % (
+                    marker,
+                    index,
+                    waypoint['name'],
+                    np.round(waypoint['xyz_mm'], 1).tolist(),
+                )
+            )
+
+    def publish_direct_move(self, xyz_mm):
+        msg = Point()
+        msg.x = float(xyz_mm[0])
+        msg.y = float(xyz_mm[1])
+        msg.z = float(xyz_mm[2])
+        self.delta_move_pub.publish(msg)
+        self.get_logger().info(
+            'sent delta move to %s mm'
+            % np.round(np.array([msg.x, msg.y, msg.z]), 1).tolist()
+        )
+
+    def publish_staged_move(self, xyz_mm):
+        target = np.array(xyz_mm, dtype=float)
+        current = np.array(self.delta_xyz_mm, dtype=float)
+        travel_z = self.travel_z_mm()
+        feedrate = self.feedrate()
+        staged_points = [
+            (current[0], current[1], travel_z),
+            (target[0], target[1], travel_z),
+            (target[0], target[1], target[2]),
+        ]
+
+        lines = ['G90']
+        for x_mm, y_mm, z_mm in staged_points:
+            lines.append('G1 X%.2f Y%.2f Z%.2f F%.2f' % (x_mm, y_mm, z_mm, feedrate))
+
+        msg = String()
+        msg.data = '\n'.join(lines)
+        self.raw_gcode_pub.publish(msg)
+        self.delta_xyz_mm = target
+        self.get_logger().info(
+            'sent staged delta move: current=(%.1f, %.1f, %.1f) -> travel_z=%.1f -> target=%s mm'
+            % (
+                current[0],
+                current[1],
+                current[2],
+                travel_z,
+                np.round(target, 1).tolist(),
+            )
+        )
+
+    def publish_move(self, xyz_mm):
+        if self.use_staged_motion():
+            self.publish_staged_move(xyz_mm)
+        else:
+            self.publish_direct_move(xyz_mm)
+
+    def move_to_waypoint(self, index):
+        if not self.waypoints:
+            self.get_logger().warning('no waypoints available')
+            return False
+        index = max(0, min(index, len(self.waypoints) - 1))
+        waypoint = self.waypoints[index]
+        self.current_waypoint_index = index
+        self.publish_move(waypoint['xyz_mm'])
+        self.get_logger().info(f'moving to waypoint {index + 1}/{len(self.waypoints)}: {waypoint["name"]}')
+        return True
+
+    def wait_with_spin(self, duration_sec):
+        end_time = time.time() + max(0.0, duration_sec)
+        while rclpy.ok() and time.time() < end_time:
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+    def wait_for_stable_detection(self, min_image_seq):
+        timeout_sec = self.post_move_detect_timeout_sec()
+        stable_needed = self.stable_detection_frames()
+        tolerance_m = self.stable_detection_tolerance_mm() / 1000.0
+        end_time = time.time() + timeout_sec
+        last_detection_seq = -1
+        last_tvec = None
+        stable_count = 0
+
+        while rclpy.ok() and time.time() < end_time:
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if self.latest_detection is None:
+                stable_count = 0
+                last_tvec = None
+                continue
+            if self.latest_detection_seq <= min_image_seq:
+                continue
+            if self.latest_detection_seq == last_detection_seq:
+                continue
+
+            tvec = self.latest_detection['tvec'].reshape(3).astype(float)
+            if last_tvec is None:
+                stable_count = 1
+            else:
+                shift = float(np.linalg.norm(tvec - last_tvec))
+                stable_count = stable_count + 1 if shift <= tolerance_m else 1
+            last_tvec = tvec
+            last_detection_seq = self.latest_detection_seq
+
+            if stable_count >= stable_needed:
+                return True
+
+        return False
+
+    def auto_run_waypoints(self):
+        if not self.waypoints:
+            self.get_logger().warning('no waypoints to auto-run')
+            return
+        self.get_logger().info(
+            'auto-running waypoints %d..%d/%d with settle %.2f sec, max_consecutive_skips=%d'
+            % (
+                self.auto_start_index(),
+                self.auto_end_index() if self.auto_end_index() > 0 else len(self.waypoints),
+                len(self.waypoints),
+                self.move_settle_sec(),
+                self.max_consecutive_skips(),
+            )
+        )
+        saved_before = len(self.samples)
+        start_index = self.auto_start_index() - 1
+        end_index = self.auto_end_index()
+        if end_index <= 0:
+            end_index = len(self.waypoints)
+        end_index = min(end_index, len(self.waypoints))
+        consecutive_skips = 0
+        for index in range(start_index, end_index):
+            if not rclpy.ok():
+                break
+            image_seq_before_move = self.image_seq
+            self.move_to_waypoint(index)
+            self.wait_with_spin(self.move_settle_sec())
+            if not self.wait_for_stable_detection(image_seq_before_move):
+                consecutive_skips += 1
+                self.get_logger().warning(
+                    'waypoint %d skipped: ChArUco board was not stable after move (%d/%d consecutive skips)'
+                    % (index + 1, consecutive_skips, self.max_consecutive_skips())
+                )
+                if consecutive_skips >= self.max_consecutive_skips():
+                    self.get_logger().error(
+                        'auto-run stopped after %d consecutive skipped waypoints; camera cannot see the board in this region'
+                        % consecutive_skips
+                    )
+                    break
+                continue
+            consecutive_skips = 0
+            self.save_sample()
+        self.get_logger().info(
+            'auto-run finished: saved %d new samples'
+            % (len(self.samples) - saved_before)
+        )
 
     def log_box(self, title, lines, level='info'):
         width = 72
@@ -234,7 +664,10 @@ class DeltaCharucoCalibration(Node):
             return
 
         self.latest_image = image
+        self.image_seq += 1
         self.latest_detection = self.detect_charuco(image, msg.header.frame_id)
+        if self.latest_detection is not None:
+            self.latest_detection_seq = self.image_seq
         now = time.time()
         status_period = float(self.get_parameter('status_period_sec').value)
         if now - self.last_status_time > status_period:
@@ -551,6 +984,38 @@ class DeltaCharucoCalibration(Node):
                 self.list_samples()
             elif key == 'u':
                 self.undo_sample()
+            elif key == 'p':
+                self.add_waypoint_from_current_pose()
+            elif key == 'y':
+                self.list_waypoints()
+            elif key == 'o':
+                self.save_waypoints()
+            elif key == 'r':
+                self.load_waypoints()
+            elif key == 'n':
+                if self.waypoints:
+                    next_index = (self.current_waypoint_index + 1) % len(self.waypoints)
+                    self.move_to_waypoint(next_index)
+                else:
+                    self.get_logger().warning('no waypoints available')
+            elif key == 'b':
+                if self.waypoints:
+                    prev_index = (self.current_waypoint_index - 1) % len(self.waypoints)
+                    self.move_to_waypoint(prev_index)
+                else:
+                    self.get_logger().warning('no waypoints available')
+            elif key == 'a':
+                self.auto_run_waypoints()
+            elif key == 'k':
+                self.add_boundary_point_from_current_pose()
+            elif key == 'j':
+                self.list_boundary_points()
+            elif key == 't':
+                self.save_boundary_layers()
+            elif key == 'i':
+                self.load_boundary_layers()
+            elif key == 'g':
+                self.generate_grid_waypoints_from_current_layer()
             elif key == 'q' or key == '\x03':
                 break
 

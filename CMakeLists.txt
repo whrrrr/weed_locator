@@ -127,6 +127,10 @@ install(PROGRAMS scripts/delta_visual_pick_demo.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME delta_visual_pick_demo
 )
+install(PROGRAMS scripts/delta_hand_eye_split_by_z.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME delta_hand_eye_split_by_z
+)
 install(PROGRAMS scripts/test_ik_service.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME test_ik_service
@@ -146,6 +150,14 @@ install(PROGRAMS scripts/workspace_checker.py
 install(PROGRAMS scripts/workspace_boundary_runner.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME workspace_boundary_runner
+)
+install(PROGRAMS scripts/delta_workspace_auto_runner.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME delta_workspace_auto_runner
+)
+install(PROGRAMS scripts/delta_waypoint_runner.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME delta_waypoint_runner
 )
 install(PROGRAMS scripts/conveyor_pick_scheduler.py
   DESTINATION lib/${PROJECT_NAME}
