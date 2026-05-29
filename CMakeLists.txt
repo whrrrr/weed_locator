@@ -131,10 +131,6 @@ install(PROGRAMS scripts/delta_hand_eye_split_by_z.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME delta_hand_eye_split_by_z
 )
-install(PROGRAMS scripts/delta_fit_camera_delta_model.py
-  DESTINATION lib/${PROJECT_NAME}
-  RENAME delta_fit_camera_delta_model
-)
 install(PROGRAMS scripts/test_ik_service.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME test_ik_service

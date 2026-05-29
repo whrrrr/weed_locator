@@ -47,53 +47,6 @@ def parse_float_list(text):
     return values
 
 
-def polynomial_terms(points_norm, degree):
-    x = points_norm[:, 0]
-    y = points_norm[:, 1]
-    z = points_norm[:, 2]
-    columns = [
-        np.ones(points_norm.shape[0]),
-        x,
-        y,
-        z,
-    ]
-    if degree >= 2:
-        columns.extend([x * x, y * y, z * z, x * y, x * z, y * z])
-    if degree >= 3:
-        columns.extend([
-            x * x * x,
-            y * y * y,
-            z * z * z,
-            x * x * y,
-            x * x * z,
-            y * y * x,
-            y * y * z,
-            z * z * x,
-            z * z * y,
-            x * y * z,
-        ])
-    return np.column_stack(columns)
-
-
-def load_empirical_model(path):
-    with open(path, 'r', encoding='utf-8') as stream:
-        data = yaml.safe_load(stream) or {}
-    if data.get('model_type') != 'polynomial':
-        raise ValueError(f'empirical model in {path} is not polynomial')
-    model = {
-        'path': path,
-        'degree': int(data['degree']),
-        'camera_mean_mm': np.array(data['camera_mean_mm'], dtype=float),
-        'camera_scale_mm': np.array(data['camera_scale_mm'], dtype=float),
-        'coefficients': np.array(data['coefficients'], dtype=float),
-        'train_error': data.get('train_error', {}),
-        'loocv_error': data.get('loocv_error', {}),
-    }
-    if model['coefficients'].ndim != 2 or model['coefficients'].shape[1] != 3:
-        raise ValueError(f'empirical model coefficients in {path} must be Nx3')
-    return model
-
-
 class DeltaVisualPickDemo(Node):
     def __init__(self):
         super().__init__('delta_visual_pick_demo')
@@ -113,11 +66,6 @@ class DeltaVisualPickDemo(Node):
         self.declare_parameter('layered_calibration_prefix', 'delta_hand_eye_center_z')
         self.declare_parameter('layered_calibration_zs_mm', '-180,-190,-200,-210,-220,-230')
         self.declare_parameter('calibration_select_z_mm', float('nan'))
-        self.declare_parameter('use_empirical_model', False)
-        self.declare_parameter(
-            'empirical_model_path',
-            '/home/whr/cc_ws/tros_ws/calibration_targets/delta_hand_eye_refined_poly2_model.yaml',
-        )
         self.declare_parameter('work_z_mm', -170.0)
         self.declare_parameter('use_depth', False)
         self.declare_parameter('depth_aligned_to_color', True)
@@ -188,8 +136,6 @@ class DeltaVisualPickDemo(Node):
         self.layered_calibration_prefix = str(self.get_parameter('layered_calibration_prefix').value)
         self.layered_calibration_zs_mm = parse_float_list(self.get_parameter('layered_calibration_zs_mm').value)
         self.calibration_select_z_mm = float(self.get_parameter('calibration_select_z_mm').value)
-        self.use_empirical_model = bool(self.get_parameter('use_empirical_model').value)
-        self.empirical_model_path = str(self.get_parameter('empirical_model_path').value)
         self.work_z_mm = float(self.get_parameter('work_z_mm').value)
         self.use_depth = bool(self.get_parameter('use_depth').value)
         self.depth_aligned_to_color = bool(self.get_parameter('depth_aligned_to_color').value)
@@ -260,13 +206,10 @@ class DeltaVisualPickDemo(Node):
         self.bridge = CvBridge()
         self.yolo_model = None
         self.depth_history = deque(maxlen=max(1, self.depth_temporal_window))
-        self.empirical_model = None
 
         self.layered_transforms = {}
         if self.use_layered_calibration:
             self.load_layered_calibrations()
-        if self.use_empirical_model:
-            self.empirical_model = load_empirical_model(self.empirical_model_path)
 
         self.t_delta_camera = load_transform(self.calibration_path)
         self.r_delta_camera = self.t_delta_camera[:3, :3]
@@ -291,16 +234,6 @@ class DeltaVisualPickDemo(Node):
         self.get_logger().info(f'trigger: {self.trigger_topic}')
         self.get_logger().info(f'detector: {self.detector}')
         self.get_logger().info(f'calibration: {self.calibration_path}')
-        if self.empirical_model:
-            self.get_logger().info(
-                'empirical model: %s, degree=%d, train=%s, loocv=%s'
-                % (
-                    self.empirical_model_path,
-                    self.empirical_model['degree'],
-                    self.empirical_model.get('train_error', {}),
-                    self.empirical_model.get('loocv_error', {}),
-                )
-            )
         if self.use_layered_calibration:
             self.get_logger().info(
                 'layered calibration: enabled, layers=%s, select_z=%.1f mm'
@@ -396,19 +329,6 @@ class DeltaVisualPickDemo(Node):
         ratio = clamp(ratio, 0.0, 1.0)
         z_mm = self.depth_near_z_mm + ratio * (self.depth_far_z_mm - self.depth_near_z_mm)
         return z_mm + self.depth_z_offset_mm
-
-    def predict_empirical_delta_mm(self, camera_xyz_m):
-        if self.empirical_model is None:
-            return None
-        camera_xyz_mm = np.array(camera_xyz_m, dtype=float).reshape(1, 3) * 1000.0
-        normalized = (camera_xyz_mm - self.empirical_model['camera_mean_mm']) / self.empirical_model['camera_scale_mm']
-        phi = polynomial_terms(normalized, self.empirical_model['degree'])
-        return (phi @ self.empirical_model['coefficients'])[0]
-
-    def nearest_layer_for_z(self, z_mm):
-        if not self.layered_transforms:
-            return None
-        return min(self.layered_transforms.keys(), key=lambda layer_z: abs(layer_z - float(z_mm)))
 
     def transform_for_depth_point(self, camera_xyz_m, depth_m=None):
         if not self.use_layered_calibration or not self.layered_transforms or not self.use_depth_for_layer:
@@ -621,25 +541,6 @@ class DeltaVisualPickDemo(Node):
             ],
             dtype=float,
         )
-        empirical_delta_mm = self.predict_empirical_delta_mm(camera_xyz_m)
-        if empirical_delta_mm is not None:
-            delta_xyz_mm = empirical_delta_mm + self.offset_mm
-            layer_z = self.nearest_layer_for_z(delta_xyz_mm[2])
-            stats = {
-                'count': int(valid.size),
-                'temporal_count': int(temporal_count),
-                'raw_m': float(raw_z),
-                'smooth_m': float(z),
-                'min_m': float(np.min(valid)),
-                'median_m': float(np.median(valid)),
-                'mean_m': float(np.mean(valid)),
-                'max_m': float(np.max(valid)),
-                'box': (int(x0), int(y0), int(x1 - x0), int(y1 - y0)),
-                'sample_mode': self.depth_sample_mode,
-                'mapping': 'empirical_model',
-            }
-            return camera_xyz_m, delta_xyz_mm, z, stats, layer_z
-
         r_delta_camera, t_delta_camera_vec, layer_z = self.transform_for_depth_point(camera_xyz_m, z)
         delta_xyz_m = r_delta_camera @ camera_xyz_m + t_delta_camera_vec
         delta_xyz_mm = delta_xyz_m * 1000.0 + self.offset_mm
@@ -886,7 +787,6 @@ class DeltaVisualPickDemo(Node):
         confidence = target.get('confidence', 0.0)
         layer_z = depth_info.get('layer_z_mm')
         source = depth_info.get('source', 'none')
-        mapping = stats.get('mapping', self.depth_z_mapping)
 
         lines = [
             'READY  %s %.2f  pixel=(%.0f, %.0f) area=%.0f'
@@ -895,12 +795,12 @@ class DeltaVisualPickDemo(Node):
             % (delta[0], delta[1], command_z),
             'transform_z=%.1f mm  cmd_z=%.1f mm'
             % (delta[2], command_z),
-            'source=%s  calibZ=%s  mode=%s  map=%s'
+            'source=%s  calibZ=%s  mode=%s  zmap=%s'
             % (
                 source,
                 'none' if layer_z is None else '%.0f' % layer_z,
                 self.depth_sample_mode,
-                mapping,
+                self.depth_z_mapping,
             ),
         ]
 
@@ -970,9 +870,6 @@ class DeltaVisualPickDemo(Node):
     def command_z_mm(self, transformed_z_mm, target=None):
         depth_info = (target or {}).get('depth_info') or {}
         if self.use_depth_for_z and depth_info.get('source') == 'depth':
-            stats = depth_info.get('stats') or {}
-            if stats.get('mapping') == 'empirical_model':
-                return float(transformed_z_mm) + self.depth_z_offset_mm
             if self.depth_z_mapping == 'raw_linear':
                 return self.raw_depth_to_delta_z_mm(depth_info.get('depth_m', 0.0))
             return float(transformed_z_mm) + self.depth_z_offset_mm
