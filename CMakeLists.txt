@@ -203,6 +203,10 @@ install(PROGRAMS scripts/lerobot_setup_single_motor.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME lerobot_setup_single_motor
 )
+install(PROGRAMS scripts/zlac8015d_canopen_tool.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME zlac8015d_canopen_tool
+)
 
 # 安装 launch 文件
 install(DIRECTORY launch/
