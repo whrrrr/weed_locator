@@ -54,6 +54,18 @@ class LeRobotIKJog(Node):
         self.declare_parameter('write_joints_service', '/lerobot/write_joints')
         self.declare_parameter('max_joint_delta_deg', 8.0)
         self.declare_parameter('max_position_error_m', 0.002)
+        self.declare_parameter('joint_delta_gain', 1.0)
+        self.declare_parameter('z_up_joint_delta_gain', 0.0)
+        self.declare_parameter('z_down_joint_delta_gain', 0.0)
+        self.declare_parameter('min_command_delta_deg', 0.0)
+        self.declare_parameter('z_up_min_command_delta_deg', -1.0)
+        self.declare_parameter('z_down_min_command_delta_deg', -1.0)
+        self.declare_parameter('min_command_joint_names', '')
+        self.declare_parameter('z_up_min_command_joint_names', '')
+        self.declare_parameter('z_down_min_command_joint_names', '')
+        self.declare_parameter('closed_loop', False)
+        self.declare_parameter('closed_loop_iters', 3)
+        self.declare_parameter('closed_loop_tolerance_m', 0.004)
         self.declare_parameter('verify_after_execute', True)
         self.declare_parameter('settle_sec', 1.0)
         self.declare_parameter('timeout_sec', 3.0)
@@ -130,15 +142,23 @@ class LeRobotIKJog(Node):
             target[:3, 3] += delta
         return target
 
-    def verify_executed_pose(self, kinematics, start_pose, target_pose):
+    def read_pose_after_settle(self, kinematics):
         start_count = self.joint_state_count
         self.spin_for(float(self.get_parameter('settle_sec').value))
         if self.joint_state_count == start_count:
             self.get_logger().warning('no fresh /joint_states received after command')
-            return
+            return None
 
         q_actual = self.current_arm_degrees(self.joint_state)
         t_actual = kinematics.forward_kinematics(q_actual)
+        return q_actual, t_actual
+
+    def verify_executed_pose(self, kinematics, start_pose, target_pose):
+        measured = self.read_pose_after_settle(kinematics)
+        if measured is None:
+            return None
+
+        q_actual, t_actual = measured
         actual_delta = t_actual[:3, 3] - start_pose[:3, 3]
         desired_delta = target_pose[:3, 3] - start_pose[:3, 3]
         target_error = float(np.linalg.norm(t_actual[:3, 3] - target_pose[:3, 3]))
@@ -147,6 +167,137 @@ class LeRobotIKJog(Node):
         self.get_logger().info(f'actual delta xyz: {np.round(actual_delta, 5).tolist()}')
         self.get_logger().info(f'desired delta xyz: {np.round(desired_delta, 5).tolist()}')
         self.get_logger().info(f'post-command target error: {target_error:.6f} m')
+        return q_actual, t_actual, target_error
+
+    def compensation_settings(self, cartesian_delta):
+        gain = float(self.get_parameter('joint_delta_gain').value)
+        min_delta = abs(float(self.get_parameter('min_command_delta_deg').value))
+        min_joint_names = str(self.get_parameter('min_command_joint_names').value).strip()
+        dz = float(cartesian_delta[2])
+
+        if dz > 1e-9:
+            z_gain = float(self.get_parameter('z_up_joint_delta_gain').value)
+            z_min_delta = float(self.get_parameter('z_up_min_command_delta_deg').value)
+            z_min_joint_names = str(self.get_parameter('z_up_min_command_joint_names').value).strip()
+            if z_gain > 0.0:
+                gain = z_gain
+            if z_min_delta >= 0.0:
+                min_delta = z_min_delta
+            if z_min_joint_names:
+                min_joint_names = z_min_joint_names
+        elif dz < -1e-9:
+            z_gain = float(self.get_parameter('z_down_joint_delta_gain').value)
+            z_min_delta = float(self.get_parameter('z_down_min_command_delta_deg').value)
+            z_min_joint_names = str(self.get_parameter('z_down_min_command_joint_names').value).strip()
+            if z_gain > 0.0:
+                gain = z_gain
+            if z_min_delta >= 0.0:
+                min_delta = z_min_delta
+            if z_min_joint_names:
+                min_joint_names = z_min_joint_names
+
+        return gain, abs(min_delta), min_joint_names
+
+    def apply_command_compensation(self, q_current, q_target, cartesian_delta):
+        delta = q_target - q_current
+        gain, min_delta, min_joint_names = self.compensation_settings(cartesian_delta)
+        if abs(gain - 1.0) < 1e-9 and min_delta <= 1e-9:
+            return q_target
+
+        compensated_delta = delta * gain
+        if min_delta > 1e-9:
+            if min_joint_names:
+                enabled = {name.strip() for name in min_joint_names.split(',') if name.strip()}
+            else:
+                enabled = set(ARM_JOINTS)
+            for i, value in enumerate(compensated_delta):
+                if ARM_JOINTS[i] not in enabled:
+                    continue
+                if abs(delta[i]) > 1e-9 and abs(value) < min_delta:
+                    compensated_delta[i] = math.copysign(min_delta, value)
+
+        return q_current + compensated_delta
+
+    def send_joint_command(self, q_command, gripper_percent):
+        if not self.write_client.wait_for_service(timeout_sec=float(self.get_parameter('timeout_sec').value)):
+            raise RuntimeError('/lerobot/write_joints service is not available')
+
+        request = WriteJoints.Request()
+        request.target_positions = q_command.tolist() + [gripper_percent]
+        future = self.write_client.call_async(request)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=float(self.get_parameter('timeout_sec').value))
+        result = future.result()
+        if result is None or not result.success:
+            raise RuntimeError('failed to execute /lerobot/write_joints command')
+
+    def closed_loop_correct(self, kinematics, target_pose, gripper_percent):
+        max_iters = max(0, int(self.get_parameter('closed_loop_iters').value))
+        tolerance = float(self.get_parameter('closed_loop_tolerance_m').value)
+        max_allowed_delta = float(self.get_parameter('max_joint_delta_deg').value)
+        max_allowed_error = float(self.get_parameter('max_position_error_m').value)
+
+        for iteration in range(1, max_iters + 1):
+            measured = self.read_pose_after_settle(kinematics)
+            if measured is None:
+                return
+
+            q_actual, t_actual = measured
+            target_error = float(np.linalg.norm(t_actual[:3, 3] - target_pose[:3, 3]))
+            self.get_logger().info(
+                f'closed-loop actual xyz: {np.round(t_actual[:3, 3], 5).tolist()}, '
+                f'remaining error={target_error * 1000.0:.1f} mm'
+            )
+            if target_error <= tolerance:
+                self.get_logger().info(
+                    f'closed-loop converged at iter {iteration}: error={target_error * 1000.0:.1f} mm'
+                )
+                return
+
+            q_target = kinematics.inverse_kinematics(
+                q_actual,
+                target_pose,
+                position_weight=float(self.get_parameter('position_weight').value),
+                orientation_weight=float(self.get_parameter('orientation_weight').value),
+            )
+            cartesian_delta = target_pose[:3, 3] - t_actual[:3, 3]
+            q_command = self.apply_command_compensation(q_actual, q_target, cartesian_delta)
+            t_result = kinematics.forward_kinematics(q_target)
+
+            delta_deg = q_target - q_actual
+            command_delta_deg = q_command - q_actual
+            pos_error = float(np.linalg.norm(t_result[:3, 3] - target_pose[:3, 3]))
+            max_delta = float(np.max(np.abs(command_delta_deg)))
+            self.get_logger().info(
+                f'closed-loop iter {iteration}: remaining={target_error * 1000.0:.1f} mm, '
+                f'ik_error={pos_error * 1000.0:.1f} mm, max_joint={max_delta:.2f} deg'
+            )
+            self.get_logger().info(
+                f'closed-loop delta joints deg: {np.round(delta_deg, 3).tolist()}'
+            )
+            if not np.allclose(command_delta_deg, delta_deg):
+                self.get_logger().info(
+                    f'closed-loop command delta joints deg: {np.round(command_delta_deg, 3).tolist()}'
+                )
+
+            if max_delta > max_allowed_delta or pos_error > max_allowed_error:
+                self.get_logger().warning(
+                    f'closed-loop stop: max_delta={max_delta:.3f} deg '
+                    f'(limit {max_allowed_delta:.3f}), pos_error={pos_error:.6f} m '
+                    f'(limit {max_allowed_error:.6f})'
+                )
+                return
+
+            self.send_joint_command(q_command, gripper_percent)
+            self.get_logger().info(f'closed-loop correction {iteration} sent')
+
+        measured = self.read_pose_after_settle(kinematics)
+        if measured is not None:
+            _, t_final = measured
+            final_error = float(np.linalg.norm(t_final[:3, 3] - target_pose[:3, 3]))
+            self.get_logger().info(
+                f'closed-loop final xyz: {np.round(t_final[:3, 3], 5).tolist()}, '
+                f'final error={final_error * 1000.0:.1f} mm'
+            )
 
     def run(self):
         msg = self.wait_for_joint_state()
@@ -165,11 +316,17 @@ class LeRobotIKJog(Node):
             position_weight=float(self.get_parameter('position_weight').value),
             orientation_weight=float(self.get_parameter('orientation_weight').value),
         )
+        q_command = self.apply_command_compensation(
+            q_current,
+            q_target,
+            t_target[:3, 3] - t_current[:3, 3],
+        )
         t_result = kinematics.forward_kinematics(q_target)
 
         delta_deg = q_target - q_current
+        command_delta_deg = q_command - q_current
         pos_error = float(np.linalg.norm(t_result[:3, 3] - t_target[:3, 3]))
-        max_delta = float(np.max(np.abs(delta_deg)))
+        max_delta = float(np.max(np.abs(command_delta_deg)))
 
         self.get_logger().info(f'current xyz: {np.round(t_current[:3, 3], 5).tolist()}')
         self.get_logger().info(f'target  xyz: {np.round(t_target[:3, 3], 5).tolist()}')
@@ -177,6 +334,9 @@ class LeRobotIKJog(Node):
         self.get_logger().info(f'current joints deg: {np.round(q_current, 3).tolist()}')
         self.get_logger().info(f'target  joints deg: {np.round(q_target, 3).tolist()}')
         self.get_logger().info(f'delta   joints deg: {np.round(delta_deg, 3).tolist()}')
+        if not np.allclose(command_delta_deg, delta_deg):
+            self.get_logger().info(f'command joints deg: {np.round(q_command, 3).tolist()}')
+            self.get_logger().info(f'command delta joints deg: {np.round(command_delta_deg, 3).tolist()}')
         self.get_logger().info(f'IK position error: {pos_error:.6f} m, max joint delta: {max_delta:.3f} deg')
 
         max_allowed_delta = float(self.get_parameter('max_joint_delta_deg').value)
@@ -194,18 +354,11 @@ class LeRobotIKJog(Node):
             self.get_logger().info('dry-run only; set execute:=true to send this motion')
             return
 
-        if not self.write_client.wait_for_service(timeout_sec=float(self.get_parameter('timeout_sec').value)):
-            raise RuntimeError('/lerobot/write_joints service is not available')
-
-        request = WriteJoints.Request()
-        request.target_positions = q_target.tolist() + [gripper_percent]
-        future = self.write_client.call_async(request)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=float(self.get_parameter('timeout_sec').value))
-        result = future.result()
-        if result is None or not result.success:
-            raise RuntimeError('failed to execute /lerobot/write_joints command')
+        self.send_joint_command(q_command, gripper_percent)
         self.get_logger().info('IK jog command sent')
-        if bool(self.get_parameter('verify_after_execute').value):
+        if bool(self.get_parameter('closed_loop').value):
+            self.closed_loop_correct(kinematics, t_target, gripper_percent)
+        elif bool(self.get_parameter('verify_after_execute').value):
             self.verify_executed_pose(kinematics, t_current, t_target)
 
 

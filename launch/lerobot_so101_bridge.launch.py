@@ -34,6 +34,7 @@ def generate_launch_description():
     wrist_roll_sign = LaunchConfiguration('wrist_roll_sign')
     wrist_roll_offset_deg = LaunchConfiguration('wrist_roll_offset_deg')
     elbow_p_coefficient = LaunchConfiguration('elbow_p_coefficient')
+    use_gripper = LaunchConfiguration('use_gripper')
 
     return LaunchDescription([
         DeclareLaunchArgument('port', default_value='/dev/ttyACM0'),
@@ -49,6 +50,7 @@ def generate_launch_description():
         DeclareLaunchArgument('wrist_roll_sign', default_value='1.0'),
         DeclareLaunchArgument('wrist_roll_offset_deg', default_value='0.0'),
         DeclareLaunchArgument('elbow_p_coefficient', default_value='16'),
+        DeclareLaunchArgument('use_gripper', default_value='True'),
         Node(
             package='weed_locator',
             executable='lerobot_so101_bridge',
@@ -67,6 +69,7 @@ def generate_launch_description():
                 'wrist_roll_sign': ParameterValue(wrist_roll_sign, value_type=float),
                 'wrist_roll_offset_deg': ParameterValue(wrist_roll_offset_deg, value_type=float),
                 'elbow_p_coefficient': ParameterValue(elbow_p_coefficient, value_type=int),
+                'use_gripper': ParameterValue(use_gripper, value_type=bool),
             }],
         ),
         Node(

@@ -67,6 +67,7 @@ class LeRobotSO101Bridge(Node):
         self.declare_parameter('publish_joint_states', True)
         self.declare_parameter('publish_raw_observation', True)
         self.declare_parameter('elbow_p_coefficient', 16)
+        self.declare_parameter('use_gripper', True)
 
         self.robot = None
         self.last_observation = {}
@@ -109,6 +110,27 @@ class LeRobotSO101Bridge(Node):
             cameras={},
         )
 
+    def active_motor_joints(self):
+        if bool(self.get_parameter('use_gripper').value):
+            return ALL_JOINTS
+        return ARM_JOINTS
+
+    def apply_gripper_config(self):
+        if bool(self.get_parameter('use_gripper').value):
+            return
+        if self.robot is None:
+            return
+
+        removed = False
+        if hasattr(self.robot, 'bus') and hasattr(self.robot.bus, 'motors'):
+            removed = self.robot.bus.motors.pop('gripper', None) is not None
+        for owner in (self.robot, getattr(self.robot, 'bus', None)):
+            calibration = getattr(owner, 'calibration', None)
+            if isinstance(calibration, dict):
+                calibration.pop('gripper', None)
+        if removed:
+            self.get_logger().info('use_gripper=False: removed gripper motor from LeRobot bus expectation')
+
     def apply_tuning(self):
         elbow_p = int(self.get_parameter('elbow_p_coefficient').value)
         if elbow_p <= 0 or self.robot is None or not self.robot.is_connected:
@@ -128,6 +150,7 @@ class LeRobotSO101Bridge(Node):
 
             try:
                 self.robot = SO101Follower(self.make_config())
+                self.apply_gripper_config()
                 self.robot.connect(calibrate=bool(self.get_parameter('calibrate_on_connect').value))
                 self.apply_tuning()
                 self.publish_status('connected')
@@ -229,12 +252,15 @@ class LeRobotSO101Bridge(Node):
         units = str(self.get_parameter('command_units').value).lower().strip()
         targets = list(request.target_positions)
 
-        if len(targets) < len(ALL_JOINTS):
+        active_joints = self.active_motor_joints()
+        if len(targets) == 1 and bool(self.get_parameter('use_gripper').value):
+            active_joints = ['gripper']
+        elif len(targets) < len(active_joints):
             response.success = False
             return response
 
         action = {}
-        for joint, target in zip(ALL_JOINTS, targets[: len(ALL_JOINTS)]):
+        for joint, target in zip(active_joints, targets[: len(active_joints)]):
             action[f'{joint}.pos'] = self.command_to_lerobot_value(joint, float(target), units)
 
         with self.lock:

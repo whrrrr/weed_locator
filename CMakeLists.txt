@@ -199,6 +199,18 @@ install(PROGRAMS scripts/lerobot_joint_diagnostic.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME lerobot_joint_diagnostic
 )
+install(PROGRAMS scripts/lerobot_z_response_scan.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_z_response_scan
+)
+install(PROGRAMS scripts/lerobot_z_keyboard_scan.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_z_keyboard_scan
+)
+install(PROGRAMS scripts/lerobot_empirical_keyboard_jog.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_empirical_keyboard_jog
+)
 install(PROGRAMS scripts/lerobot_setup_single_motor.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME lerobot_setup_single_motor

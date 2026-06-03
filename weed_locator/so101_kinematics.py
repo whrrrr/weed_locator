@@ -66,8 +66,8 @@ class SO101Kinematics:
         # 来源: https://github.com/Argo-Robot/controls
         self.dh_table = [
             [0, 0.0542, 0.0304, np.pi / 2],      # Joint 1: 基座
-            [0, 0.0, 0.116, 0.0],                 # Joint 2: 肩部
-            [0, 0.0, 0.1347, 0.0],                 # Joint 3: 肘部
+            [0, 0.0, 0.188, 0.0],                 # Joint 2: 肩部，改装后大臂
+            [0, 0.0, 0.230, 0.0],                 # Joint 3: 肘部，改装后小臂
             [0, 0.0, 0.0, -np.pi / 2],            # Joint 4: 腕俯仰
             [0, 0.0609, 0.0, 0.0],                # Joint 5: 腕旋转
         ]
