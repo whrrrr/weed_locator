@@ -101,6 +101,10 @@ install(PROGRAMS weed_locator/ik_service.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME ik_service
 )
+install(PROGRAMS weed_locator/ks3518_pwm_servo_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME ks3518_pwm_servo_node
+)
 
 # 安装 scripts 目录下的 Python 脚本
 install(PROGRAMS scripts/hand_eye_calibration.py

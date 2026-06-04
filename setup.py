@@ -32,6 +32,7 @@ setup(
             'dynamixel_node = weed_locator.dynamixel_node:main',
             'delta_gcode_bridge = weed_locator.delta_gcode_bridge:main',
             'test_ik_dynamixel = weed_locator.test_ik_dynamixel:main',
+            'ks3518_pwm_servo_node = weed_locator.ks3518_pwm_servo_node:main',
         ],
     },
 )
