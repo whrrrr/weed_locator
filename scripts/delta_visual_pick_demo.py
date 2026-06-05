@@ -124,6 +124,8 @@ class DeltaVisualPickDemo(Node):
         self.declare_parameter('depth_roi_px', 9)
         self.declare_parameter('depth_sample_mode', 'bbox_near')
         self.declare_parameter('depth_bbox_shrink', 0.25)
+        self.declare_parameter('depth_u_offset_px', 0.0)
+        self.declare_parameter('depth_v_offset_px', 0.0)
         self.declare_parameter('depth_percentile', 20.0)
         self.declare_parameter('depth_temporal_window', 5)
         self.declare_parameter('depth_temporal_max_pixel_jump', 20.0)
@@ -196,6 +198,8 @@ class DeltaVisualPickDemo(Node):
         self.depth_roi_px = int(self.get_parameter('depth_roi_px').value)
         self.depth_sample_mode = str(self.get_parameter('depth_sample_mode').value).lower().strip()
         self.depth_bbox_shrink = float(self.get_parameter('depth_bbox_shrink').value)
+        self.depth_u_offset_px = float(self.get_parameter('depth_u_offset_px').value)
+        self.depth_v_offset_px = float(self.get_parameter('depth_v_offset_px').value)
         self.depth_percentile = float(self.get_parameter('depth_percentile').value)
         self.depth_temporal_window = int(self.get_parameter('depth_temporal_window').value)
         self.depth_temporal_max_pixel_jump = float(self.get_parameter('depth_temporal_max_pixel_jump').value)
@@ -318,11 +322,13 @@ class DeltaVisualPickDemo(Node):
             )
         )
         self.get_logger().info(
-            'depth sampling: mode=%s, roi=%d px, bbox_shrink=%.2f, percentile=%.1f, temporal_window=%d'
+            'depth sampling: mode=%s, roi=%d px, bbox_shrink=%.2f, offset=(%.1f, %.1f) depth_px, percentile=%.1f, temporal_window=%d'
             % (
                 self.depth_sample_mode,
                 self.depth_roi_px,
                 self.depth_bbox_shrink,
+                self.depth_u_offset_px,
+                self.depth_v_offset_px,
                 self.depth_percentile,
                 self.depth_temporal_window,
             )
@@ -505,8 +511,10 @@ class DeltaVisualPickDemo(Node):
         depth_h, depth_w = self.latest_depth.shape[:2]
         color_h, color_w = color_shape[:2]
 
-        du = int(round(u * depth_w / color_w))
-        dv = int(round(v * depth_h / color_h))
+        du = int(round(u * depth_w / color_w + self.depth_u_offset_px))
+        dv = int(round(v * depth_h / color_h + self.depth_v_offset_px))
+        du = clamp(du, 0, depth_w - 1)
+        dv = clamp(dv, 0, depth_h - 1)
 
         mode = self.depth_sample_mode
         if bbox is not None and mode.startswith('bbox'):
@@ -517,10 +525,10 @@ class DeltaVisualPickDemo(Node):
             y0_color = y + h * shrink * 0.5
             y1_color = y + h * (1.0 - shrink * 0.5)
 
-            x0 = int(math.floor(x0_color * depth_w / color_w))
-            x1 = int(math.ceil(x1_color * depth_w / color_w))
-            y0 = int(math.floor(y0_color * depth_h / color_h))
-            y1 = int(math.ceil(y1_color * depth_h / color_h))
+            x0 = int(math.floor(x0_color * depth_w / color_w + self.depth_u_offset_px))
+            x1 = int(math.ceil(x1_color * depth_w / color_w + self.depth_u_offset_px))
+            y0 = int(math.floor(y0_color * depth_h / color_h + self.depth_v_offset_px))
+            y1 = int(math.ceil(y1_color * depth_h / color_h + self.depth_v_offset_px))
             x0 = clamp(x0, 0, depth_w - 1)
             x1 = clamp(x1, x0 + 1, depth_w)
             y0 = clamp(y0, 0, depth_h - 1)
@@ -635,6 +643,7 @@ class DeltaVisualPickDemo(Node):
                 'mean_m': float(np.mean(valid)),
                 'max_m': float(np.max(valid)),
                 'box': (int(x0), int(y0), int(x1 - x0), int(y1 - y0)),
+                'depth_pixel': (int(du), int(dv)),
                 'sample_mode': self.depth_sample_mode,
                 'mapping': 'empirical_model',
             }
@@ -653,6 +662,7 @@ class DeltaVisualPickDemo(Node):
             'mean_m': float(np.mean(valid)),
             'max_m': float(np.max(valid)),
             'box': (int(x0), int(y0), int(x1 - x0), int(y1 - y0)),
+            'depth_pixel': (int(du), int(dv)),
             'sample_mode': self.depth_sample_mode,
         }
         return camera_xyz_m, delta_xyz_mm, z, stats, layer_z
@@ -820,6 +830,24 @@ class DeltaVisualPickDemo(Node):
             delta = target['delta_xyz_mm']
             cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 255, 255), 2)
             cv2.drawMarker(canvas, (u, v), (0, 0, 255), cv2.MARKER_CROSS, 24, 2)
+            depth_info = target.get('depth_info') or {}
+            stats = depth_info.get('stats') or {}
+            box = stats.get('box')
+            if depth_info.get('source') == 'depth' and box and self.latest_depth is not None:
+                depth_h, depth_w = self.latest_depth.shape[:2]
+                color_h, color_w = frame.shape[:2]
+                dx, dy, dw, dh = box
+                cx0 = int(round(dx * color_w / max(depth_w, 1)))
+                cy0 = int(round(dy * color_h / max(depth_h, 1)))
+                cx1 = int(round((dx + dw) * color_w / max(depth_w, 1)))
+                cy1 = int(round((dy + dh) * color_h / max(depth_h, 1)))
+                cv2.rectangle(canvas, (cx0, cy0), (cx1, cy1), (0, 255, 0), 2)
+                depth_pixel = stats.get('depth_pixel')
+                if depth_pixel:
+                    du, dv = depth_pixel
+                    cu = int(round(du * color_w / max(depth_w, 1)))
+                    cv = int(round(dv * color_h / max(depth_h, 1)))
+                    cv2.drawMarker(canvas, (cu, cv), (0, 255, 0), cv2.MARKER_CROSS, 18, 2)
             self.draw_text_panel(canvas, self.overlay_lines(target), (12, 12))
             if not self.point_in_workspace(delta[0], delta[1], self.command_z_mm(delta[2], target)):
                 cv2.putText(
@@ -921,6 +949,15 @@ class DeltaVisualPickDemo(Node):
                     stats.get('median_m', 0.0),
                     stats.get('max_m', 0.0),
                     stats.get('count', 0),
+                )
+            )
+            lines.append(
+                'depth px=%s  box=%s  offset_px=(%.1f, %.1f)'
+                % (
+                    stats.get('depth_pixel', 'none'),
+                    stats.get('box', 'none'),
+                    self.depth_u_offset_px,
+                    self.depth_v_offset_px,
                 )
             )
         else:
