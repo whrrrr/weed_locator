@@ -63,11 +63,17 @@ class LeRobotSO101Bridge(Node):
         self.declare_parameter('max_relative_target', 10.0)
         self.declare_parameter('command_units', 'degrees')
         self.declare_parameter('wrist_roll_sign', 1.0)
+        self.declare_parameter('shoulder_pan_offset_deg', 0.0)
+        self.declare_parameter('shoulder_lift_offset_deg', 0.0)
+        self.declare_parameter('elbow_flex_offset_deg', 0.0)
+        self.declare_parameter('wrist_flex_offset_deg', 0.0)
         self.declare_parameter('wrist_roll_offset_deg', 0.0)
         self.declare_parameter('publish_joint_states', True)
         self.declare_parameter('publish_raw_observation', True)
         self.declare_parameter('elbow_p_coefficient', 16)
         self.declare_parameter('use_gripper', True)
+        self.declare_parameter('disabled_motor_joints', '')
+        self.declare_parameter('fixed_elbow_flex_deg', 0.0)
 
         self.robot = None
         self.last_observation = {}
@@ -111,29 +117,64 @@ class LeRobotSO101Bridge(Node):
         )
 
     def active_motor_joints(self):
-        if bool(self.get_parameter('use_gripper').value):
-            return ALL_JOINTS
-        return ARM_JOINTS
+        joints = list(ALL_JOINTS if bool(self.get_parameter('use_gripper').value) else ARM_JOINTS)
+        disabled = self.disabled_motor_joints()
+        return [joint for joint in joints if joint not in disabled]
 
-    def apply_gripper_config(self):
-        if bool(self.get_parameter('use_gripper').value):
-            return
+    def disabled_motor_joints(self):
+        raw = str(self.get_parameter('disabled_motor_joints').value).strip()
+        disabled = {joint.strip() for joint in raw.split(',') if joint.strip()}
+        if not bool(self.get_parameter('use_gripper').value):
+            disabled.add('gripper')
+        unknown = disabled - set(ALL_JOINTS)
+        if unknown:
+            self.get_logger().warning(f'ignoring unknown disabled_motor_joints: {sorted(unknown)}')
+        return disabled & set(ALL_JOINTS)
+
+    def fixed_lerobot_value(self, joint_name):
+        if joint_name == 'elbow_flex':
+            return float(self.get_parameter('fixed_elbow_flex_deg').value)
+        if joint_name == 'gripper':
+            return 0.0
+        return 0.0
+
+    def apply_motor_config(self):
         if self.robot is None:
             return
 
-        removed = False
+        disabled = self.disabled_motor_joints()
+        removed = []
         if hasattr(self.robot, 'bus') and hasattr(self.robot.bus, 'motors'):
-            removed = self.robot.bus.motors.pop('gripper', None) is not None
+            for joint in disabled:
+                if self.robot.bus.motors.pop(joint, None) is not None:
+                    removed.append(joint)
         for owner in (self.robot, getattr(self.robot, 'bus', None)):
             calibration = getattr(owner, 'calibration', None)
             if isinstance(calibration, dict):
-                calibration.pop('gripper', None)
+                for joint in disabled:
+                    calibration.pop(joint, None)
         if removed:
-            self.get_logger().info('use_gripper=False: removed gripper motor from LeRobot bus expectation')
+            self.refresh_bus_cache()
+            self.get_logger().info(f'removed disabled motors from LeRobot bus expectation: {removed}')
+
+    def refresh_bus_cache(self):
+        bus = getattr(self.robot, 'bus', None)
+        if bus is None or not hasattr(bus, 'motors'):
+            return
+
+        if hasattr(bus, '_id_to_model_dict'):
+            bus._id_to_model_dict = {motor.id: motor.model for motor in bus.motors.values()}
+        if hasattr(bus, '_id_to_name_dict'):
+            bus._id_to_name_dict = {motor.id: name for name, motor in bus.motors.items()}
+        for cached_name in ('ids', 'models', '_has_different_ctrl_tables'):
+            bus.__dict__.pop(cached_name, None)
 
     def apply_tuning(self):
         elbow_p = int(self.get_parameter('elbow_p_coefficient').value)
         if elbow_p <= 0 or self.robot is None or not self.robot.is_connected:
+            return
+        if 'elbow_flex' in self.disabled_motor_joints():
+            self.get_logger().info('elbow_flex disabled: skipping P_Coefficient tuning')
             return
 
         try:
@@ -150,7 +191,7 @@ class LeRobotSO101Bridge(Node):
 
             try:
                 self.robot = SO101Follower(self.make_config())
-                self.apply_gripper_config()
+                self.apply_motor_config()
                 self.robot.connect(calibrate=bool(self.get_parameter('calibrate_on_connect').value))
                 self.apply_tuning()
                 self.publish_status('connected')
@@ -210,7 +251,10 @@ class LeRobotSO101Bridge(Node):
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = ALL_JOINTS
-        msg.position = [self.observation_to_ros_radians(joint, observation.get(f'{joint}.pos', 0.0)) for joint in ALL_JOINTS]
+        msg.position = [
+            self.observation_to_ros_radians(joint, observation.get(f'{joint}.pos', self.fixed_lerobot_value(joint)))
+            for joint in ALL_JOINTS
+        ]
         self.joint_pub.publish(msg)
 
     def observation_to_ros_radians(self, joint_name, value):
@@ -219,8 +263,7 @@ class LeRobotSO101Bridge(Node):
             return self.percent_to_limit_rad(joint_name, value)
 
         if bool(self.get_parameter('use_degrees').value):
-            if joint_name == 'wrist_roll':
-                value = self.correct_wrist_roll_degrees(value)
+            value = self.correct_joint_degrees(joint_name, value)
             return math.radians(value)
 
         return self.normalized_to_limit_rad(joint_name, value)
@@ -244,7 +287,10 @@ class LeRobotSO101Bridge(Node):
                 response.success = False
                 return response
 
-            response.positions = [float(self.last_observation.get(f'{joint}.pos', 0.0)) for joint in ALL_JOINTS]
+            response.positions = [
+                float(self.last_observation.get(f'{joint}.pos', self.fixed_lerobot_value(joint)))
+                for joint in ALL_JOINTS
+            ]
             response.success = True
             return response
 
@@ -260,8 +306,14 @@ class LeRobotSO101Bridge(Node):
             return response
 
         action = {}
-        for joint, target in zip(active_joints, targets[: len(active_joints)]):
-            action[f'{joint}.pos'] = self.command_to_lerobot_value(joint, float(target), units)
+        if len(targets) >= len(ALL_JOINTS):
+            target_by_joint = dict(zip(ALL_JOINTS, targets[: len(ALL_JOINTS)]))
+        else:
+            target_by_joint = dict(zip(active_joints, targets[: len(active_joints)]))
+
+        for joint in active_joints:
+            if joint in target_by_joint:
+                action[f'{joint}.pos'] = self.command_to_lerobot_value(joint, float(target_by_joint[joint]), units)
 
         with self.lock:
             if self.robot is None or not self.robot.is_connected:
@@ -284,34 +336,50 @@ class LeRobotSO101Bridge(Node):
             if joint_name == 'gripper':
                 return self.gripper_rad_to_percent(target)
             target_deg = math.degrees(target)
-            if joint_name == 'wrist_roll':
-                target_deg = self.uncorrect_wrist_roll_degrees(target_deg)
+            target_deg = self.uncorrect_joint_degrees(joint_name, target_deg)
             return target_deg if bool(self.get_parameter('use_degrees').value) else target
 
         if units == 'normalized' and bool(self.get_parameter('use_degrees').value):
             if joint_name == 'gripper':
                 return target
             target_deg = math.degrees(self.normalized_to_limit_rad(joint_name, target))
-            if joint_name == 'wrist_roll':
-                target_deg = self.uncorrect_wrist_roll_degrees(target_deg)
+            target_deg = self.uncorrect_joint_degrees(joint_name, target_deg)
             return target_deg
 
-        if units == 'degrees' and joint_name == 'wrist_roll':
-            return self.uncorrect_wrist_roll_degrees(target)
+        if units == 'degrees':
+            return self.uncorrect_joint_degrees(joint_name, target)
 
         return target
 
-    def correct_wrist_roll_degrees(self, value):
-        sign = float(self.get_parameter('wrist_roll_sign').value)
-        offset = float(self.get_parameter('wrist_roll_offset_deg').value)
+    def joint_offset_deg(self, joint_name):
+        parameter_name = f'{joint_name}_offset_deg'
+        if not self.has_parameter(parameter_name):
+            return 0.0
+        return float(self.get_parameter(parameter_name).value)
+
+    def joint_sign(self, joint_name):
+        if joint_name == 'wrist_roll':
+            sign = float(self.get_parameter('wrist_roll_sign').value)
+            if abs(sign) < 1e-9:
+                return 1.0
+            return sign
+        return 1.0
+
+    def correct_joint_degrees(self, joint_name, value):
+        sign = self.joint_sign(joint_name)
+        offset = self.joint_offset_deg(joint_name)
         return sign * float(value) + offset
 
-    def uncorrect_wrist_roll_degrees(self, value):
-        sign = float(self.get_parameter('wrist_roll_sign').value)
-        offset = float(self.get_parameter('wrist_roll_offset_deg').value)
-        if abs(sign) < 1e-9:
-            sign = 1.0
+    def uncorrect_joint_degrees(self, joint_name, value):
+        sign = self.joint_sign(joint_name)
+        offset = self.joint_offset_deg(joint_name)
         return (float(value) - offset) / sign
+
+    def correct_wrist_roll_degrees(self, value):
+        return self.correct_joint_degrees('wrist_roll', value)
+
+    def uncorrect_wrist_roll_degrees(self, value):
+        return self.uncorrect_joint_degrees('wrist_roll', value)
 
     def gripper_rad_to_percent(self, value):
         low, high = URDF_LIMITS_RAD['gripper']

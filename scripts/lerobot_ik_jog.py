@@ -47,6 +47,8 @@ class LeRobotIKJog(Node):
         self.declare_parameter('relative_frame', 'base')
         self.declare_parameter('execute', False)
         self.declare_parameter('target_frame', 'gripper_frame_link')
+        self.declare_parameter('urdf_path', '')
+        self.declare_parameter('arm_joint_names', ','.join(ARM_JOINTS))
         self.declare_parameter('position_weight', 1.0)
         self.declare_parameter('orientation_weight', 0.0)
         self.declare_parameter('joint_state_topic', '/joint_states')
@@ -72,6 +74,7 @@ class LeRobotIKJog(Node):
 
         self.joint_state = None
         self.joint_state_count = 0
+        self.arm_joints = self.parse_arm_joint_names()
         self.create_subscription(
             JointState,
             str(self.get_parameter('joint_state_topic').value),
@@ -91,6 +94,19 @@ class LeRobotIKJog(Node):
             rclpy.spin_once(self, timeout_sec=0.1)
         return self.joint_state
 
+    def parse_arm_joint_names(self):
+        names = [
+            name.strip()
+            for name in str(self.get_parameter('arm_joint_names').value).split(',')
+            if name.strip()
+        ]
+        if not names:
+            raise RuntimeError('arm_joint_names must not be empty')
+        unknown = [name for name in names if name not in ARM_JOINTS]
+        if unknown:
+            raise RuntimeError(f'unknown arm_joint_names: {unknown}; expected subset of {ARM_JOINTS}')
+        return names
+
     def spin_for(self, duration_sec):
         deadline = time.monotonic() + max(0.0, float(duration_sec))
         while rclpy.ok() and time.monotonic() < deadline:
@@ -99,10 +115,10 @@ class LeRobotIKJog(Node):
 
     def current_arm_degrees(self, msg):
         positions_by_name = dict(zip(msg.name, msg.position, strict=False))
-        missing = [name for name in ARM_JOINTS if name not in positions_by_name]
+        missing = [name for name in self.arm_joints if name not in positions_by_name]
         if missing:
             raise RuntimeError(f'/joint_states missing joints: {missing}')
-        return np.array([math.degrees(float(positions_by_name[name])) for name in ARM_JOINTS], dtype=float)
+        return np.array([math.degrees(float(positions_by_name[name])) for name in self.arm_joints], dtype=float)
 
     def read_gripper_percent(self):
         if not self.read_client.wait_for_service(timeout_sec=float(self.get_parameter('timeout_sec').value)):
@@ -117,11 +133,15 @@ class LeRobotIKJog(Node):
 
     def make_kinematics(self):
         pkg_dir = get_package_share_directory('weed_locator')
-        urdf_path = str(Path(pkg_dir) / 'config' / 'SO101' / 'so101_new_calib.urdf')
+        urdf_path = str(self.get_parameter('urdf_path').value).strip()
+        if not urdf_path:
+            urdf_name = 'so101_no_elbow.urdf' if 'elbow_flex' not in self.arm_joints else 'so101_new_calib.urdf'
+            urdf_path = str(Path(pkg_dir) / 'config' / 'SO101' / urdf_name)
+        self.get_logger().info(f'IK URDF: {urdf_path}')
         return RobotKinematics(
             urdf_path,
             target_frame_name=str(self.get_parameter('target_frame').value),
-            joint_names=ARM_JOINTS,
+            joint_names=self.arm_joints,
         )
 
     def desired_pose(self, current_pose):
@@ -209,9 +229,9 @@ class LeRobotIKJog(Node):
             if min_joint_names:
                 enabled = {name.strip() for name in min_joint_names.split(',') if name.strip()}
             else:
-                enabled = set(ARM_JOINTS)
+                enabled = set(self.arm_joints)
             for i, value in enumerate(compensated_delta):
-                if ARM_JOINTS[i] not in enabled:
+                if self.arm_joints[i] not in enabled:
                     continue
                 if abs(delta[i]) > 1e-9 and abs(value) < min_delta:
                     compensated_delta[i] = math.copysign(min_delta, value)
@@ -222,8 +242,18 @@ class LeRobotIKJog(Node):
         if not self.write_client.wait_for_service(timeout_sec=float(self.get_parameter('timeout_sec').value)):
             raise RuntimeError('/lerobot/write_joints service is not available')
 
+        targets = [float(value) for value in q_command]
+        targets.append(float(gripper_percent))
+        bad = [
+            (index, value)
+            for index, value in enumerate(targets)
+            if not math.isfinite(value)
+        ]
+        if bad:
+            raise RuntimeError(f'IK command contains non-finite target_positions: {bad}')
+
         request = WriteJoints.Request()
-        request.target_positions = q_command.tolist() + [gripper_percent]
+        request.target_positions = targets
         future = self.write_client.call_async(request)
         rclpy.spin_until_future_complete(self, future, timeout_sec=float(self.get_parameter('timeout_sec').value))
         result = future.result()

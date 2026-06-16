@@ -195,6 +195,14 @@ install(PROGRAMS scripts/lerobot_ik_keyboard_jog.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME lerobot_ik_keyboard_jog
 )
+install(PROGRAMS scripts/lerobot_tcp_marker.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_tcp_marker
+)
+install(PROGRAMS scripts/lerobot_frame_markers.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_frame_markers
+)
 install(PROGRAMS scripts/lerobot_joint_jog.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME lerobot_joint_jog

@@ -72,6 +72,10 @@ class DeltaCharucoCalibration(Node):
         self.declare_parameter('waypoint_path', '/home/whr/cc_ws/tros_ws/calibration_targets/delta_calibration_waypoints.yaml')
         self.declare_parameter('boundary_path', '/home/whr/cc_ws/tros_ws/calibration_targets/delta_workspace_slices.yaml')
         self.declare_parameter('debug_image_path', '/tmp/delta_charuco_debug.png')
+        self.declare_parameter('publish_debug_image', True)
+        self.declare_parameter('debug_image_topic', '/delta_charuco/debug_image')
+        self.declare_parameter('show_window', False)
+        self.declare_parameter('window_name', 'delta charuco calibration')
         self.declare_parameter('squares_x', 6)
         self.declare_parameter('squares_y', 5)
         self.declare_parameter('square_length_m', 0.028)
@@ -98,6 +102,7 @@ class DeltaCharucoCalibration(Node):
         self.camera_matrix = None
         self.dist_coeffs = None
         self.latest_image = None
+        self.latest_debug_image = None
         self.latest_detection = None
         self.image_seq = 0
         self.latest_detection_seq = -1
@@ -106,6 +111,8 @@ class DeltaCharucoCalibration(Node):
             'charuco_corners': 0,
             'reason': 'no image yet',
         }
+        self.show_window = bool(self.get_parameter('show_window').value)
+        self.window_name = str(self.get_parameter('window_name').value)
         self.validation_transform = None
         self.validation_path_loaded = None
         self.samples = []
@@ -187,6 +194,11 @@ class DeltaCharucoCalibration(Node):
         self.predicted_delta_pub = self.create_publisher(
             PointStamped,
             '/delta_charuco/predicted_delta_point',
+            10,
+        )
+        self.debug_image_pub = self.create_publisher(
+            Image,
+            str(self.get_parameter('debug_image_topic').value),
             10,
         )
 
@@ -666,6 +678,8 @@ class DeltaCharucoCalibration(Node):
         self.latest_image = image
         self.image_seq += 1
         self.latest_detection = self.detect_charuco(image, msg.header.frame_id)
+        if bool(self.get_parameter('publish_debug_image').value) and self.latest_debug_image is not None:
+            self.publish_debug_image(msg.header)
         if self.latest_detection is not None:
             self.latest_detection_seq = self.image_seq
         now = time.time()
@@ -679,6 +693,7 @@ class DeltaCharucoCalibration(Node):
                         f'reason: {self.latest_detect_debug.get("reason", "unknown")}',
                         f'markers detected: {self.latest_detect_debug.get("markers", 0)}',
                         f'charuco corners: {self.latest_detect_debug.get("charuco_corners", 0)}',
+                        self.marker_quality_line(self.latest_detect_debug),
                         f'min required corners: {int(self.get_parameter("min_charuco_corners").value)}',
                         f'samples: {len(self.samples)}',
                         f'delta_xyz_mm: {np.round(self.delta_xyz_mm, 1).tolist()}',
@@ -697,10 +712,11 @@ class DeltaCharucoCalibration(Node):
 
     def make_status_lines(self, camera_xyz_m, corner_count):
         lines = [
-                        f'corners: {corner_count}  (>=8 ok, more is better)',
+            f'corners: {corner_count}  (>=8 ok, more is better)',
+            self.marker_quality_line(self.latest_detection),
             f'camera_xyz_m: {np.round(camera_xyz_m, 4).tolist()}',
-                        f'delta_xyz_mm: {np.round(self.delta_xyz_mm, 1).tolist()}',
-                        f'samples saved: {len(self.samples)}',
+            f'delta_xyz_mm: {np.round(self.delta_xyz_mm, 1).tolist()}',
+            f'samples saved: {len(self.samples)}',
         ]
         if self.validation_transform is not None:
             camera_h = np.append(camera_xyz_m.reshape(3), 1.0)
@@ -725,16 +741,27 @@ class DeltaCharucoCalibration(Node):
         msg.point.z = float(predicted_m[2])
         self.predicted_delta_pub.publish(msg)
 
+    def publish_debug_image(self, header):
+        try:
+            msg = self.bridge.cv2_to_imgmsg(self.latest_debug_image, encoding='bgr8')
+        except Exception as exc:
+            self.get_logger().warning(f'failed to publish debug image: {exc}')
+            return
+        msg.header = header
+        self.debug_image_pub.publish(msg)
+
     def detect_charuco(self, image, frame_id):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         charuco_corners, charuco_ids, marker_corners, marker_ids = self.detector.detectBoard(gray)
         min_corners = int(self.get_parameter('min_charuco_corners').value)
         marker_count = 0 if marker_ids is None else int(len(marker_ids))
         charuco_count = 0 if charuco_ids is None else int(len(charuco_ids))
+        marker_stats = self.compute_marker_pixel_stats(marker_corners)
         self.latest_detect_debug = {
             'markers': marker_count,
             'charuco_corners': charuco_count,
             'reason': 'ok',
+            **marker_stats,
         }
         if charuco_corners is None or charuco_ids is None or len(charuco_ids) < min_corners:
             if marker_count == 0:
@@ -745,7 +772,16 @@ class DeltaCharucoCalibration(Node):
                 'markers': marker_count,
                 'charuco_corners': charuco_count,
                 'reason': reason,
+                **marker_stats,
             }
+            self.latest_debug_image = self.make_debug_image(
+                image,
+                None,
+                marker_corners=marker_corners,
+                marker_ids=marker_ids,
+                charuco_corners=charuco_corners,
+                charuco_ids=charuco_ids,
+            )
             return None
 
         all_corners = np.asarray(self.board.getChessboardCorners(), dtype=np.float32)
@@ -763,7 +799,7 @@ class DeltaCharucoCalibration(Node):
         if not ok:
             return None
 
-        return {
+        detection = {
             'rvec': rvec.reshape(3, 1),
             'tvec': tvec.reshape(3, 1),
             'corner_count': len(ids),
@@ -772,7 +808,145 @@ class DeltaCharucoCalibration(Node):
             'marker_corners': marker_corners,
             'marker_ids': marker_ids,
             'frame_id': frame_id,
+            **marker_stats,
         }
+        self.latest_debug_image = self.make_debug_image(image, detection)
+        return detection
+
+    def compute_marker_pixel_stats(self, marker_corners):
+        if marker_corners is None or len(marker_corners) == 0:
+            return {
+                'marker_px_mean': 0.0,
+                'marker_px_min': 0.0,
+                'marker_px_max': 0.0,
+                'marker_quality': 'NO MARKERS',
+            }
+
+        sizes = []
+        for corners in marker_corners:
+            pts = np.asarray(corners, dtype=float).reshape(-1, 2)
+            if len(pts) != 4:
+                continue
+            sides = [
+                np.linalg.norm(pts[(index + 1) % 4] - pts[index])
+                for index in range(4)
+            ]
+            sizes.append(float(np.mean(sides)))
+
+        if not sizes:
+            return {
+                'marker_px_mean': 0.0,
+                'marker_px_min': 0.0,
+                'marker_px_max': 0.0,
+                'marker_quality': 'NO MARKERS',
+            }
+
+        mean_px = float(np.mean(sizes))
+        min_px = float(np.min(sizes))
+        max_px = float(np.max(sizes))
+        if min_px >= 30.0:
+            quality = 'GOOD'
+        elif min_px >= 22.0:
+            quality = 'OK'
+        elif min_px >= 16.0:
+            quality = 'SMALL'
+        else:
+            quality = 'TOO SMALL'
+
+        return {
+            'marker_px_mean': mean_px,
+            'marker_px_min': min_px,
+            'marker_px_max': max_px,
+            'marker_quality': quality,
+        }
+
+    def marker_quality_line(self, data):
+        mean_px = float(data.get('marker_px_mean', 0.0))
+        min_px = float(data.get('marker_px_min', 0.0))
+        max_px = float(data.get('marker_px_max', 0.0))
+        quality = str(data.get('marker_quality', 'UNKNOWN'))
+        return f'marker px mean/min/max: {mean_px:.1f}/{min_px:.1f}/{max_px:.1f}  quality={quality}'
+
+    def make_debug_image(
+        self,
+        image,
+        detection,
+        marker_corners=None,
+        marker_ids=None,
+        charuco_corners=None,
+        charuco_ids=None,
+    ):
+        debug = image.copy()
+        data = detection if detection is not None else self.latest_detect_debug
+        if detection is not None:
+            marker_corners = detection.get('marker_corners')
+            marker_ids = detection.get('marker_ids')
+            charuco_corners = detection.get('charuco_corners')
+            charuco_ids = detection.get('charuco_ids')
+
+        if marker_corners is not None and marker_ids is not None:
+            cv2.aruco.drawDetectedMarkers(debug, marker_corners, marker_ids)
+
+        if charuco_corners is not None and charuco_ids is not None:
+            cv2.aruco.drawDetectedCornersCharuco(
+                debug,
+                charuco_corners,
+                charuco_ids,
+                (0, 255, 255),
+            )
+
+        if detection is not None:
+            cv2.drawFrameAxes(
+                debug,
+                self.camera_matrix,
+                self.dist_coeffs,
+                detection['rvec'],
+                detection['tvec'],
+                0.05,
+            )
+
+        lines = [
+            f'markers: {data.get("markers", 0)}  charuco: {data.get("charuco_corners", 0)}',
+            self.marker_quality_line(data),
+            'threshold: GOOD >=30px, OK >=22px, SMALL >=16px, TOO SMALL <16px',
+        ]
+        if detection is None:
+            lines.append(f'reason: {data.get("reason", "unknown")}')
+        self.draw_text_panel(debug, lines, (10, 10))
+        return debug
+
+    def draw_text_panel(self, image, lines, origin):
+        x, y = origin
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.55
+        thickness = 1
+        line_h = 22
+        width = 0
+        for line in lines:
+            (text_w, _text_h), _baseline = cv2.getTextSize(line, font, scale, thickness)
+            width = max(width, text_w)
+        height = line_h * len(lines) + 12
+        overlay = image.copy()
+        cv2.rectangle(overlay, (x, y), (x + width + 16, y + height), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.65, image, 0.35, 0, image)
+        for index, line in enumerate(lines):
+            color = (0, 255, 0)
+            if 'TOO SMALL' in line:
+                color = (0, 0, 255)
+            elif 'SMALL' in line:
+                color = (0, 200, 255)
+            elif 'OK' in line:
+                color = (0, 255, 255)
+            cv2.putText(
+                image,
+                line,
+                (x + 8, y + 24 + index * line_h),
+                font,
+                scale,
+                color,
+                thickness,
+                cv2.LINE_AA,
+            )
 
     def publish_board_pose(self, header, detection):
         r_mat, _ = cv2.Rodrigues(detection['rvec'])
@@ -935,24 +1109,13 @@ class DeltaCharucoCalibration(Node):
         return True
 
     def write_debug_image(self):
-        if self.latest_image is None:
+        if self.latest_debug_image is None and self.latest_image is None:
             self.get_logger().warning('no image received yet')
             return
-        debug = self.latest_image.copy()
-        if self.latest_detection is not None:
-            cv2.aruco.drawDetectedCornersCharuco(
-                debug,
-                self.latest_detection['charuco_corners'],
-                self.latest_detection['charuco_ids'],
-            )
-            cv2.drawFrameAxes(
-                debug,
-                self.camera_matrix,
-                self.dist_coeffs,
-                self.latest_detection['rvec'],
-                self.latest_detection['tvec'],
-                0.05,
-            )
+        if self.latest_debug_image is not None:
+            debug = self.latest_debug_image.copy()
+        else:
+            debug = self.latest_image.copy()
         path = Path(os.path.expanduser(str(self.get_parameter('debug_image_path').value)))
         cv2.imwrite(str(path), debug)
         self.get_logger().info(f'wrote debug image: {path}')
@@ -971,6 +1134,17 @@ class DeltaCharucoCalibration(Node):
     def spin_keyboard(self):
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.02)
+            if self.show_window and self.latest_debug_image is not None:
+                cv2.imshow(self.window_name, self.latest_debug_image)
+                window_key = cv2.waitKey(1) & 0xFF
+                if window_key == ord(' '):
+                    self.save_sample()
+                elif window_key == ord('c'):
+                    self.compute_and_save()
+                elif window_key == ord('w'):
+                    self.write_debug_image()
+                elif window_key == ord('q'):
+                    break
             key = self.get_key()
             if key is None:
                 continue
@@ -1018,6 +1192,8 @@ class DeltaCharucoCalibration(Node):
                 self.generate_grid_waypoints_from_current_layer()
             elif key == 'q' or key == '\x03':
                 break
+        if self.show_window:
+            cv2.destroyAllWindows()
 
 
 def main(args=None):

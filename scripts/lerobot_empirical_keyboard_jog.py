@@ -447,6 +447,13 @@ class LeRobotEmpiricalKeyboardJog(Node):
             self.get_logger().warning(f'rejected {key}: max joint delta {max_delta:.2f} > {max_allowed:.2f} deg')
             return
         self.send_joints(q_start + command_delta, self.cached_gripper_percent())
+        if bool(self.get_parameter('continuous_verify_motion').value):
+            self.spin_for(0.18)
+            q_after = self.current_arm_degrees()
+            self.get_logger().info(
+                f'continuous {key}: cmd={np.round(command_delta, 2).tolist()}, '
+                f'actual_joints={np.round(q_after - q_start, 2).tolist()}'
+            )
         self.continuous_command_count += 1
         log_every = max(1, int(self.get_parameter('continuous_log_every').value))
         if self.continuous_command_count % log_every == 0:

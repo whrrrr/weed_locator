@@ -64,7 +64,7 @@ joints:
 # 连杆长度 (从 URDF 提取, 单位: 米)
 link_lengths:
   base_to_shoulder: 0.0949      # 基座到肩部
-  shoulder_to_upper_arm: 0.1880  # 肩部到上臂，改装后实测
+  shoulder_to_upper_arm: 0.1890  # 肩部到上臂，改装后实测
   upper_arm_to_lower_arm: 0.2300  # 上臂到前臂，改装后实测
   lower_arm_to_wrist: 0.0611      # 前臂到腕部
   wrist_to_gripper: 0.0181       # 腕部到夹爪
