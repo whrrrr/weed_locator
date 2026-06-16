@@ -38,7 +38,9 @@ class DeltaGcodeBridge(Node):
         self.declare_parameter('startup_delay_sec', 2.0)
         self.declare_parameter('default_feedrate', 80.0)
         self.declare_parameter('command_interval_sec', 0.05)
+        self.declare_parameter('reconnect_interval_sec', 1.0)
         self.declare_parameter('auto_absolute_mode', True)
+        self.declare_parameter('log_sent_commands', False)
 
         self.port = self.get_parameter('port').value
         self.baudrate = int(self.get_parameter('baudrate').value)
@@ -46,10 +48,13 @@ class DeltaGcodeBridge(Node):
         self.startup_delay_sec = float(self.get_parameter('startup_delay_sec').value)
         self.default_feedrate = float(self.get_parameter('default_feedrate').value)
         self.command_interval_sec = float(self.get_parameter('command_interval_sec').value)
+        self.reconnect_interval_sec = float(self.get_parameter('reconnect_interval_sec').value)
         self.auto_absolute_mode = bool(self.get_parameter('auto_absolute_mode').value)
+        self.log_sent_commands = bool(self.get_parameter('log_sent_commands').value)
 
         self.serial_conn = None
         self.last_write_time = 0.0
+        self.last_reconnect_attempt_time = 0.0
 
         self.status_pub = self.create_publisher(String, '/delta_arm/status', 20)
         self.gcode_echo_pub = self.create_publisher(String, '/delta_arm/last_gcode', 20)
@@ -80,15 +85,35 @@ class DeltaGcodeBridge(Node):
             self.get_logger().info(f'已打开串口 {self.port} @ {self.baudrate}')
             time.sleep(self.startup_delay_sec)
             self.flush_input()
-        except SerialException as exc:
+        except (SerialException, OSError) as exc:
             self.serial_conn = None
             self.get_logger().error(f'打开串口失败: {exc}')
+
+    def close_serial_after_error(self, reason):
+        self.get_logger().error(f'串口连接异常，准备重连: {reason}')
+        if self.serial_conn:
+            try:
+                if self.serial_conn.is_open:
+                    self.serial_conn.close()
+            except (SerialException, OSError) as exc:
+                self.get_logger().warning(f'关闭异常串口失败: {exc}')
+        self.serial_conn = None
+
+    def maybe_reconnect_serial(self, force=False):
+        if self.serial_conn and self.serial_conn.is_open:
+            return True
+        now = time.time()
+        if not force and now - self.last_reconnect_attempt_time < self.reconnect_interval_sec:
+            return False
+        self.last_reconnect_attempt_time = now
+        self.open_serial()
+        return bool(self.serial_conn and self.serial_conn.is_open)
 
     def flush_input(self):
         if self.serial_conn and self.serial_conn.is_open:
             try:
                 self.serial_conn.reset_input_buffer()
-            except SerialException as exc:
+            except (SerialException, OSError) as exc:
                 self.get_logger().warning(f'清空串口输入缓冲失败: {exc}')
 
     def publish_status(self, text: str):
@@ -112,6 +137,8 @@ class DeltaGcodeBridge(Node):
             return False
 
         if not self.serial_conn or not self.serial_conn.is_open:
+            self.maybe_reconnect_serial(force=True)
+        if not self.serial_conn or not self.serial_conn.is_open:
             self.get_logger().error('串口未打开，无法发送 G-code')
             return False
 
@@ -122,10 +149,12 @@ class DeltaGcodeBridge(Node):
             self.serial_conn.flush()
             self.last_write_time = time.time()
             self.publish_last_gcode(payload.strip())
-            self.get_logger().info(f'发送: {payload.strip()}')
+            if self.log_sent_commands:
+                self.get_logger().info(f'发送: {payload.strip()}')
             return True
-        except SerialException as exc:
+        except (SerialException, OSError) as exc:
             self.get_logger().error(f'发送串口数据失败: {exc}')
+            self.close_serial_after_error(exc)
             return False
 
     def send_gcode_block(self, block: str):
@@ -162,6 +191,7 @@ class DeltaGcodeBridge(Node):
     def poll_serial(self):
         """Read and republish any serial feedback from the ESP32."""
         if not self.serial_conn or not self.serial_conn.is_open:
+            self.maybe_reconnect_serial()
             return
 
         try:
@@ -176,13 +206,17 @@ class DeltaGcodeBridge(Node):
                     continue
                 self.publish_status(text)
                 self.get_logger().info(f'ESP32: {text}')
-        except SerialException as exc:
+        except (SerialException, OSError) as exc:
             self.get_logger().error(f'读取串口数据失败: {exc}')
+            self.close_serial_after_error(exc)
 
     def close(self):
         if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
-            self.get_logger().info('已关闭 ESP32 串口')
+            try:
+                self.serial_conn.close()
+                self.get_logger().info('已关闭 ESP32 串口')
+            except (SerialException, OSError) as exc:
+                self.get_logger().warning(f'关闭 ESP32 串口失败: {exc}')
 
 
 def main(args=None):
