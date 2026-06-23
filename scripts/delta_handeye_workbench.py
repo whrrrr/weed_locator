@@ -579,6 +579,14 @@ class HandeyeWorkbench:
         ttk.Button(vacuum, text='关闭吸嘴', command=self.start_suction_off).pack(side='left', padx=5)
         ttk.Button(vacuum, text='释放棋子', command=self.start_suction_release).pack(side='left')
         ttk.Label(parent, text='开启：关闭泄气阀后开泵。关闭：只停泵。释放：打开泄气阀约 0.4 秒后停泵并关闭阀门。', wraplength=450).pack(anchor='w')
+        ttk.Label(parent, text='传送带控制', font=('Sans', 10, 'bold')).pack(anchor='w', pady=(8, 0))
+        conveyor = ttk.Frame(parent)
+        conveyor.pack(fill='x', pady=4)
+        ttk.Button(conveyor, text='停止', command=self.start_conveyor_stop).pack(side='left')
+        ttk.Button(conveyor, text='低速', command=lambda: self.start_conveyor_speed('低速', 'M201')).pack(side='left', padx=5)
+        ttk.Button(conveyor, text='中速', command=lambda: self.start_conveyor_speed('中速', 'M202')).pack(side='left', padx=5)
+        ttk.Button(conveyor, text='高速', command=lambda: self.start_conveyor_speed('高速', 'M203')).pack(side='left')
+        ttk.Label(parent, text='当前四键使用固件的正转档位：低/中/高分别为 200/500/1000 Hz。', wraplength=450).pack(anchor='w')
         ttk.Label(parent, text='执行采用固定的三段运动：先到 Z=-210 mm，再横移 XY，最后到目标 Z。模型和偏移只从这里的执行设置读取。', wraplength=450).pack(anchor='w')
 
     def choose_yaml(self, variable):
@@ -854,6 +862,20 @@ class HandeyeWorkbench:
         time.sleep(0.10)
         self.node.send_gcode('M2')
         self.current_status = '已释放：泄气 0.4 秒，气泵停止，泄气阀复位关闭。'
+
+    def start_conveyor_stop(self):
+        self.start_worker('停止传送带', self.conveyor_stop_worker)
+
+    def conveyor_stop_worker(self):
+        self.node.send_gcode('M200')
+        self.current_status = '已发送传送带停止 M200。'
+
+    def start_conveyor_speed(self, speed_name, gcode):
+        self.start_worker(f'传送带{speed_name}', lambda: self.conveyor_speed_worker(speed_name, gcode))
+
+    def conveyor_speed_worker(self, speed_name, gcode):
+        self.node.send_gcode(gcode)
+        self.current_status = f'已发送传送带正转{speed_name}：{gcode}。'
 
     def start_collection(self):
         try:
