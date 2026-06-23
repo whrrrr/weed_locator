@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
@@ -15,12 +16,14 @@ def generate_launch_description():
     image_topic = LaunchConfiguration('image_topic', default='/camera/image_raw')
     model_path = LaunchConfiguration(
         'model_path',
-        default='/home/whr/文档/xwechat_files/wxid_mc7cj27h4kzg22_bc6c/msg/file/2026-05/best.pt',
+        default=PathJoinSubstitution([
+            FindPackageShare('weed_locator'), 'models', 'xiangqi_best.pt'
+        ]),
     )
     chess_class_name = LaunchConfiguration('chess_class_name', default='xiangqi')
     confidence_threshold = LaunchConfiguration('confidence_threshold', default='0.15')
     processing_interval_sec = LaunchConfiguration('processing_interval_sec', default='0.2')
-    device = LaunchConfiguration('device', default='cuda:0')
+    device = LaunchConfiguration('device', default='auto')
     image_width = LaunchConfiguration('image_width', default='640.0')
     top_line_y = LaunchConfiguration('top_line_y', default='120.0')
     bottom_line_y = LaunchConfiguration('bottom_line_y', default='385.0')

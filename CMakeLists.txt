@@ -123,6 +123,14 @@ install(PROGRAMS scripts/delta_keyboard_jog.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME delta_keyboard_jog
 )
+install(PROGRAMS scripts/delta_safe_calibration_control.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME delta_safe_calibration_control
+)
+install(PROGRAMS scripts/delta_safe_control_gui.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME delta_safe_control_gui
+)
 install(PROGRAMS scripts/delta_charuco_calibration.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME delta_charuco_calibration
@@ -167,6 +175,22 @@ install(PROGRAMS scripts/delta_waypoint_runner.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME delta_waypoint_runner
 )
+install(PROGRAMS scripts/opencv_camera_publisher.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME opencv_camera_publisher
+)
+install(PROGRAMS scripts/depth_image_visualizer.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME depth_image_visualizer
+)
+install(PROGRAMS scripts/depth_to_color_registration.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME depth_to_color_registration
+)
+install(PROGRAMS scripts/colored_pointcloud_from_rgbd.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME colored_pointcloud_from_rgbd
+)
 install(PROGRAMS scripts/conveyor_pick_scheduler.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME conveyor_pick_scheduler
@@ -178,6 +202,18 @@ install(PROGRAMS scripts/conveyor_controller.py
 install(PROGRAMS scripts/chess_detector.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME chess_detector
+)
+install(PROGRAMS scripts/chess_handeye_target.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME chess_handeye_target
+)
+install(PROGRAMS scripts/chess_test_gui.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME chess_test_gui
+)
+install(PROGRAMS scripts/delta_handeye_workbench.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME delta_handeye_workbench
 )
 install(PROGRAMS scripts/track_line_tuner.py
   DESTINATION lib/${PROJECT_NAME}
@@ -232,6 +268,14 @@ install(DIRECTORY launch/
 # 安装 config 文件 (包括 SO101 URDF 和 mesh) - 安装到share目录供package://使用
 install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
+)
+
+install(DIRECTORY rviz/
+  DESTINATION share/${PROJECT_NAME}/rviz
+)
+
+install(DIRECTORY models/
+  DESTINATION share/${PROJECT_NAME}/models
 )
 
 ament_package()

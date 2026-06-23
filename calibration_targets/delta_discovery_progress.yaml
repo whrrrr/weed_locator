@@ -1,0 +1,428 @@
+time_sec: 1781599581.3965833
+accepted_sample_pairs:
+- index: 1
+  camera_xyz_m:
+  - 0.1277991122241909
+  - 0.019521685401771297
+  - 0.41501124885045726
+  delta_xyz_mm:
+  - 0.0
+  - 0.0
+  - -230.0
+  corner_count: 17
+- index: 2
+  camera_xyz_m:
+  - 0.13861288415464115
+  - 0.025003289120797738
+  - 0.4100955517518447
+  delta_xyz_mm:
+  - 0.0
+  - -10.0
+  - -230.0
+  corner_count: 15
+- index: 3
+  camera_xyz_m:
+  - 0.10511928524179916
+  - 0.01557980441703514
+  - 0.42823661777284283
+  delta_xyz_mm:
+  - 0.0
+  - 20.0
+  - -230.0
+  corner_count: 17
+- index: 4
+  camera_xyz_m:
+  - 0.1291205010431353
+  - 0.0014007835408334612
+  - 0.4346343479841361
+  delta_xyz_mm:
+  - -20.0
+  - 10.0
+  - -230.0
+  corner_count: 15
+- index: 5
+  camera_xyz_m:
+  - 0.10227135598622224
+  - 0.03269834798503009
+  - 0.40404269828031564
+  delta_xyz_mm:
+  - 20.0
+  - 10.0
+  - -230.0
+  corner_count: 15
+- index: 6
+  camera_xyz_m:
+  - 0.09240016443238815
+  - 0.00810003646586852
+  - 0.4296630301042824
+  delta_xyz_mm:
+  - 0.0
+  - 30.0
+  - -230.0
+  corner_count: 16
+- index: 7
+  camera_xyz_m:
+  - 0.07633917416290147
+  - 0.01278844634988491
+  - 0.42782215481951935
+  delta_xyz_mm:
+  - 10.0
+  - 40.0
+  - -230.0
+  corner_count: 15
+- index: 8
+  camera_xyz_m:
+  - 0.12273872838164362
+  - 0.026357639900008098
+  - 0.4065801880806639
+  delta_xyz_mm:
+  - 10.0
+  - 0.0
+  - -230.0
+  corner_count: 15
+- index: 9
+  camera_xyz_m:
+  - 0.1544995913572481
+  - 0.017705666776477547
+  - 0.40942264394846195
+  delta_xyz_mm:
+  - -10.0
+  - -20.0
+  - -230.0
+  corner_count: 15
+- index: 10
+  camera_xyz_m:
+  - 0.10016069696916216
+  - 0.02186090502999341
+  - 0.4208371123264264
+  delta_xyz_mm:
+  - 10.0
+  - 20.0
+  - -230.0
+  corner_count: 17
+- index: 11
+  camera_xyz_m:
+  - 0.08111566354326431
+  - 0.027929804865025297
+  - 0.4153268556347513
+  delta_xyz_mm:
+  - 20.0
+  - 30.0
+  - -230.0
+  corner_count: 16
+- index: 12
+  camera_xyz_m:
+  - 0.07096799180873338
+  - 0.04603887821029661
+  - 0.4022327601465164
+  delta_xyz_mm:
+  - 40.0
+  - 30.0
+  - -230.0
+  corner_count: 15
+- index: 13
+  camera_xyz_m:
+  - 0.08775506367682914
+  - 0.019452191125064505
+  - 0.42520607212427686
+  delta_xyz_mm:
+  - 10.0
+  - 30.0
+  - -230.0
+  corner_count: 17
+- index: 14
+  camera_xyz_m:
+  - 0.10745472095289695
+  - 0.022671438902830982
+  - 0.40785983717312013
+  delta_xyz_mm:
+  - 10.0
+  - 10.0
+  - -230.0
+  corner_count: 17
+- index: 15
+  camera_xyz_m:
+  - 0.1157178394254284
+  - 0.016208636786454064
+  - 0.4218824000519476
+  delta_xyz_mm:
+  - 0.0
+  - 10.0
+  - -230.0
+  corner_count: 15
+- index: 16
+  camera_xyz_m:
+  - 0.08671223803030616
+  - 0.04114113482381827
+  - 0.40614760767282565
+  delta_xyz_mm:
+  - 30.0
+  - 20.0
+  - -230.0
+  corner_count: 17
+- index: 17
+  camera_xyz_m:
+  - 0.09530447016948641
+  - 0.028931963093868113
+  - 0.4127798702915428
+  delta_xyz_mm:
+  - 20.0
+  - 20.0
+  - -230.0
+  corner_count: 14
+- index: 18
+  camera_xyz_m:
+  - 0.10107969661381788
+  - 0.05920922152631581
+  - 0.38443986647363
+  delta_xyz_mm:
+  - 40.0
+  - 0.0
+  - -230.0
+  corner_count: 17
+- index: 19
+  camera_xyz_m:
+  - 0.13182138721659736
+  - 0.054146058598360844
+  - 0.3802674410912559
+  delta_xyz_mm:
+  - 30.0
+  - -20.0
+  - -230.0
+  corner_count: 17
+- index: 20
+  camera_xyz_m:
+  - 0.1484171497448793
+  - 0.04878807923473847
+  - 0.38429827966877994
+  delta_xyz_mm:
+  - 20.0
+  - -30.0
+  - -230.0
+  corner_count: 17
+- index: 21
+  camera_xyz_m:
+  - 0.16627066953461592
+  - 0.04718270604213941
+  - 0.3852222086358412
+  delta_xyz_mm:
+  - 10.0
+  - -40.0
+  - -230.0
+  corner_count: 15
+- index: 22
+  camera_xyz_m:
+  - 0.11552257299114667
+  - 0.060709666023893
+  - 0.38197175561429214
+  delta_xyz_mm:
+  - 40.0
+  - -10.0
+  - -230.0
+  corner_count: 17
+- index: 23
+  camera_xyz_m:
+  - 0.1252922761957839
+  - 0.0647014669898323
+  - 0.37341228005614346
+  delta_xyz_mm:
+  - 40.0
+  - -20.0
+  - -230.0
+  corner_count: 14
+- index: 24
+  camera_xyz_m:
+  - 0.08952570579453648
+  - 0.0756029185941768
+  - 0.37700398479318536
+  delta_xyz_mm:
+  - 60.0
+  - 0.0
+  - -230.0
+  corner_count: 17
+- index: 25
+  camera_xyz_m:
+  - 0.08177102564755133
+  - 0.07106786414722666
+  - 0.3785988648523982
+  delta_xyz_mm:
+  - 60.0
+  - 10.0
+  - -230.0
+  corner_count: 17
+corner_heatmap:
+  cell_mm: 20.0
+  observed_cell_count: 15
+  hot_regions:
+  - &id009
+    center_xyz_mm:
+    - 40
+    - 0
+    - -230
+    count: 2
+    accepted_count: 2
+    avg_corners: 17.0
+    max_corners: 17
+    min_corners: 17
+  - center_xyz_mm:
+    - 60
+    - 0
+    - -230
+    count: 2
+    accepted_count: 2
+    avg_corners: 17.0
+    max_corners: 17
+    min_corners: 17
+  - center_xyz_mm:
+    - 40
+    - 20
+    - -230
+    count: 1
+    accepted_count: 1
+    avg_corners: 17.0
+    max_corners: 17
+    min_corners: 17
+  - center_xyz_mm:
+    - 20
+    - -40
+    - -230
+    count: 1
+    accepted_count: 1
+    avg_corners: 17.0
+    max_corners: 17
+    min_corners: 17
+  - &id008
+    center_xyz_mm:
+    - 0
+    - 20
+    - -230
+    count: 3
+    accepted_count: 2
+    avg_corners: 16.33
+    max_corners: 17
+    min_corners: 15
+  - &id007
+    center_xyz_mm:
+    - 0
+    - 40
+    - -230
+    count: 4
+    accepted_count: 3
+    avg_corners: 16.0
+    max_corners: 17
+    min_corners: 15
+  - &id006
+    center_xyz_mm:
+    - 0
+    - 0
+    - -230
+    count: 5
+    accepted_count: 5
+    avg_corners: 15.8
+    max_corners: 17
+    min_corners: 15
+  - &id005
+    center_xyz_mm:
+    - 40
+    - -20
+    - -230
+    count: 2
+    accepted_count: 2
+    avg_corners: 15.5
+    max_corners: 17
+    min_corners: 14
+  - &id004
+    center_xyz_mm:
+    - 20
+    - 40
+    - -230
+    count: 1
+    accepted_count: 1
+    avg_corners: 16.0
+    max_corners: 16
+    min_corners: 16
+  - &id001
+    center_xyz_mm:
+    - -20
+    - 0
+    - -230
+    count: 1
+    accepted_count: 1
+    avg_corners: 15.0
+    max_corners: 15
+    min_corners: 15
+  - &id002
+    center_xyz_mm:
+    - 20
+    - 0
+    - -230
+    count: 1
+    accepted_count: 1
+    avg_corners: 15.0
+    max_corners: 15
+    min_corners: 15
+  - &id003
+    center_xyz_mm:
+    - 0
+    - -20
+    - -230
+    count: 1
+    accepted_count: 1
+    avg_corners: 15.0
+    max_corners: 15
+    min_corners: 15
+  cold_regions:
+  - center_xyz_mm:
+    - 20
+    - 20
+    - -230
+    count: 1
+    accepted_count: 1
+    avg_corners: 14.0
+    max_corners: 14
+    min_corners: 14
+  - *id001
+  - *id002
+  - *id003
+  - center_xyz_mm:
+    - 40
+    - 40
+    - -230
+    count: 1
+    accepted_count: 1
+    avg_corners: 15.0
+    max_corners: 15
+    min_corners: 15
+  - center_xyz_mm:
+    - 0
+    - -40
+    - -230
+    count: 1
+    accepted_count: 1
+    avg_corners: 15.0
+    max_corners: 15
+    min_corners: 15
+  - *id004
+  - *id005
+  - *id006
+  - *id007
+  - *id008
+  - *id009
+state: rotation_ready
+total_candidates: 361
+max_probes: 260
+probed: 27
+accepted: 25
+rejected: 2
+target_waypoints: 25
+remaining_candidates: 334
+bad_zones: 0
+accepted_by_z:
+  '-230': 25
+progress_percent: 100
+waypoint_path: /home/wyy/gpt_dev_ws/calibration_targets/delta_safe_9_waypoints.yaml
+bad_zone_path: /home/wyy/gpt_dev_ws/calibration_targets/delta_bad_discovery_zones.yaml
+corner_observation_path: /home/wyy/gpt_dev_ws/calibration_targets/delta_corner_observations.yaml
+next_action: Automatic translation calibration sampling is finished. Rotation-axis
+  sampling is optional and independent; use the Board Rotation buttons only when you
+  intentionally want that data.

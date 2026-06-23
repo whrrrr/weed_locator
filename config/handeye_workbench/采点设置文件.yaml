@@ -1,0 +1,16 @@
+min_charuco_corners: 14
+stable_frames: 4
+stable_origin_tolerance_mm: 1.5
+max_wait_per_point_sec: 5.0
+initial_motion_wait_sec: 2.0
+samples_per_layer: 15
+start_layer_z_mm: -290.0
+layer_count: 1
+home_before_start: true
+home_after_each_point: false
+home_after_each_layer: true
+feedrate_mm_per_min: 80.0
+travel_z_mm: -210.0
+minimum_depth_corners: 4
+max_pnp_reprojection_error_px: 1.5
+format: delta_handeye_sampling_settings/v1

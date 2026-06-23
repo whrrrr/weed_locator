@@ -12,6 +12,10 @@ __pycache__/
 # ROS2 generated files
 *.egg-info/
 *.a
+weed_locator/*.so
+
+# Firmware build output
+firmware/esp32/out/
 
 # IDE
 .vscode/

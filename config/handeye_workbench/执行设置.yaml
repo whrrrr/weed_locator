@@ -1,0 +1,6 @@
+format: delta_handeye_execution_settings/v1
+model_source: pnp
+offset_mm:
+  x: 85.0
+  y: 100.0
+  z: 20.0

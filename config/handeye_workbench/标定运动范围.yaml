@@ -1,0 +1,13 @@
+format: delta_handeye_motion_range/v1
+units: mm
+default_polygon_xy_mm:
+- - -75
+  - -55
+- - 75
+  - -55
+- - 75
+  - 95
+- - -75
+  - 95
+layers: {}
+note: 默认范围和各层范围都必须是 Delta 坐标系中 Z 固定的 XY 平面多边形。

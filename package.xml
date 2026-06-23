@@ -17,6 +17,7 @@
   <depend>std_srvs</depend>
   <depend>rcl_interfaces</depend>
   <depend>message_filters</depend>
+  <depend>astra_camera_msgs</depend>
   <depend>rosidl_default_generators</depend>
   <depend>rosidl_generator_python</depend>
   <depend>ament_cmake_python</depend>

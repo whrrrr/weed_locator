@@ -79,9 +79,19 @@ class DeltaCharucoCalibration(Node):
 
         self.declare_parameter('image_topic', '/camera/color/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/color/camera_info')
+        self.declare_parameter('depth_topic', '/camera/depth/image_raw')
+        self.declare_parameter('depth_camera_info_topic', '/camera/depth/camera_info')
+        self.declare_parameter('depth_validation_enabled', True)
+        self.declare_parameter('depth_validation_path', '/tmp/delta_depth_pnp_validation.yaml')
+        self.declare_parameter('depth_validation_window_px', 3)
+        self.declare_parameter('depth_validation_max_age_sec', 0.15)
+        self.declare_parameter('depth_validation_min_m', 0.05)
+        self.declare_parameter('depth_validation_max_m', 2.0)
+        self.declare_parameter('depth_validation_log_corners', False)
         self.declare_parameter('delta_move_topic', '/delta_arm/move_to')
         self.declare_parameter('delta_home_topic', '/delta_arm/home')
         self.declare_parameter('save_path', '/home/whr/cc_ws/tros_ws/calibration_targets/delta_hand_eye.yaml')
+        self.declare_parameter('dual_calibration_path', '/tmp/delta_hand_eye_pnp_depth_dual.yaml')
         self.declare_parameter('validation_path', '/home/whr/cc_ws/tros_ws/calibration_targets/delta_hand_eye_filtered.yaml')
         self.declare_parameter('waypoint_path', '/home/whr/cc_ws/tros_ws/calibration_targets/delta_calibration_waypoints.yaml')
         self.declare_parameter('boundary_path', '/home/whr/cc_ws/tros_ws/calibration_targets/delta_workspace_slices.yaml')
@@ -93,8 +103,8 @@ class DeltaCharucoCalibration(Node):
         self.declare_parameter('debug_image_path', '/tmp/delta_charuco_debug.png')
         self.declare_parameter('squares_x', 6)
         self.declare_parameter('squares_y', 5)
-        self.declare_parameter('square_length_m', 0.028)
-        self.declare_parameter('marker_length_m', 0.020)
+        self.declare_parameter('square_length_m', 0.020)
+        self.declare_parameter('marker_length_m', 0.014)
         self.declare_parameter('dictionary', 'DICT_4X4_50')
         self.declare_parameter('min_charuco_corners', 14)
         self.declare_parameter('max_reprojection_error_px', 1.5)
@@ -103,6 +113,7 @@ class DeltaCharucoCalibration(Node):
         self.declare_parameter('move_settle_sec', 2.0)
         self.declare_parameter('home_before_discovery', True)
         self.declare_parameter('home_between_samples', False)
+        self.declare_parameter('home_before_each_discovery_probe', False)
         self.declare_parameter('home_settle_sec', 4.0)
         self.declare_parameter('use_staged_motion', False)
         self.declare_parameter('travel_z_mm', -170.0)
@@ -144,11 +155,16 @@ class DeltaCharucoCalibration(Node):
         self.declare_parameter('discover_bad_zone_radius_mm', 5.0)
         self.declare_parameter('discover_bad_zone_max_corners', 11)
         self.declare_parameter('discover_adaptive_radius_mm', 25.0)
+        self.declare_parameter('discover_existing_sample_radius_mm', 6.0)
+        self.declare_parameter('discover_sampling_mode', 'heatmap')
         self.declare_parameter('discover_max_probes', 260)
 
         self.bridge = CvBridge()
         self.camera_matrix = None
         self.dist_coeffs = None
+        self.depth_camera_matrix = None
+        self.latest_depth_msg = None
+        self.depth_validation_samples = []
         self.latest_image = None
         self.latest_detection = None
         self.latest_raw_detection = None
@@ -160,6 +176,7 @@ class DeltaCharucoCalibration(Node):
             'reason': 'no image yet',
         }
         self.validation_transform = None
+        self.validation_planar_model = None
         self.validation_path_loaded = None
         self.samples = []
         self.manual_rotation_samples = []
@@ -168,6 +185,7 @@ class DeltaCharucoCalibration(Node):
         self.boundary_layers = {}
         self.bad_zones = []
         self.corner_observations = []
+        self.discovery_progress = {}
         self.last_status_time = 0.0
         self.long_task_running = False
         self.cancel_long_task = False
@@ -203,6 +221,18 @@ class DeltaCharucoCalibration(Node):
             Image,
             str(self.get_parameter('image_topic').value),
             self.on_image,
+            10,
+        )
+        self.create_subscription(
+            CameraInfo,
+            str(self.get_parameter('depth_camera_info_topic').value),
+            self.on_depth_camera_info,
+            10,
+        )
+        self.create_subscription(
+            Image,
+            str(self.get_parameter('depth_topic').value),
+            self.on_depth,
             10,
         )
         self.create_subscription(
@@ -403,11 +433,15 @@ class DeltaCharucoCalibration(Node):
         try:
             with path.open('r', encoding='utf-8') as file:
                 data = yaml.safe_load(file)
-            self.validation_transform = np.array(data['T_delta_camera'], dtype=float)
+            if 'T_delta_camera' in data:
+                self.validation_transform = np.array(data['T_delta_camera'], dtype=float)
+            self.validation_planar_model = data.get('planar_affine_camera_xyz_to_delta_xy')
             self.validation_path_loaded = str(path)
             err = data.get('error', {})
+            if self.validation_planar_model:
+                err = self.validation_planar_model.get('error', err)
             self.get_logger().info(
-                'loaded validation transform: %s (rmse=%.2f mm, samples=%s)'
+                'loaded validation model: %s (rmse=%.2f mm, samples=%s)'
                 % (
                     path,
                     float(err.get('rmse_m', 0.0)) * 1000.0,
@@ -473,6 +507,9 @@ class DeltaCharucoCalibration(Node):
 
     def home_before_discovery(self):
         return bool(self.get_parameter('home_before_discovery').value)
+
+    def home_before_each_discovery_probe(self):
+        return bool(self.get_parameter('home_before_each_discovery_probe').value)
 
     def home_settle_sec(self):
         return float(self.get_parameter('home_settle_sec').value)
@@ -767,11 +804,11 @@ class DeltaCharucoCalibration(Node):
             lines.append('(none yet)')
         for pair in pairs[-20:]:
             lines.append(
-                '%02d corners=%d  camera_m=%s  delta_mm=%s'
+                '%02d corners=%d  camera_mm=%s  delta_mm=%s'
                 % (
                     pair['index'],
                     pair['corner_count'],
-                    np.round(np.array(pair['camera_xyz_m'], dtype=float), 4).tolist(),
+                    np.round(np.array(pair['camera_xyz_m'], dtype=float) * 1000.0, 1).tolist(),
                     np.round(np.array(pair['delta_xyz_mm'], dtype=float), 1).tolist(),
                 )
             )
@@ -836,6 +873,7 @@ class DeltaCharucoCalibration(Node):
             'corner_heatmap': heatmap,
             **kwargs,
         }
+        self.discovery_progress = data
         with path.open('w', encoding='utf-8') as file:
             yaml.safe_dump(data, file, sort_keys=False, allow_unicode=True)
         self.write_discovery_dashboard(data)
@@ -998,6 +1036,16 @@ class DeltaCharucoCalibration(Node):
     def discover_adaptive_radius_mm(self):
         return max(1.0, float(self.get_parameter('discover_adaptive_radius_mm').value))
 
+    def discover_existing_sample_radius_mm(self):
+        return max(0.0, float(self.get_parameter('discover_existing_sample_radius_mm').value))
+
+    def discover_sampling_mode(self):
+        mode = str(self.get_parameter('discover_sampling_mode').value).strip().lower()
+        if mode not in ('heatmap', 'uniform'):
+            self.get_logger().warning('unknown discover_sampling_mode "%s"; using heatmap' % mode)
+            return 'heatmap'
+        return mode
+
     def discover_max_probes(self):
         return max(1, int(self.get_parameter('discover_max_probes').value))
 
@@ -1008,6 +1056,21 @@ class DeltaCharucoCalibration(Node):
                 continue
             center = np.array([float(zone['x_mm']), float(zone['y_mm'])], dtype=float)
             radius = min(float(zone.get('radius_mm', self.discover_bad_zone_radius_mm())), self.discover_bad_zone_radius_mm())
+            if float(np.linalg.norm(point[:2] - center)) <= radius:
+                return True
+        return False
+
+    def is_near_accepted_observation(self, xyz):
+        radius = self.discover_existing_sample_radius_mm()
+        if radius <= 0.0:
+            return False
+        point = np.array(xyz, dtype=float)
+        for item in self.corner_observations:
+            if not bool(item.get('accepted', False)):
+                continue
+            if abs(float(item.get('z_mm', point[2])) - point[2]) > self.discover_z_step_mm() * 0.25:
+                continue
+            center = np.array([float(item['x_mm']), float(item['y_mm'])], dtype=float)
             if float(np.linalg.norm(point[:2] - center)) <= radius:
                 return True
         return False
@@ -1057,7 +1120,11 @@ class DeltaCharucoCalibration(Node):
                     x_values = x_values[::-1]
                 for x_mm in x_values:
                     xyz = np.array([float(x_mm), float(y_mm), float(z_mm)], dtype=float)
-                    if self.validate_target(xyz) and not self.is_in_bad_zone(xyz):
+                    if (
+                        self.validate_target(xyz)
+                        and not self.is_in_bad_zone(xyz)
+                        and not self.is_near_accepted_observation(xyz)
+                    ):
                         dist = float(np.linalg.norm(xyz[:2] - center)) + abs(z_mm - self.discover_z_mm()) * 0.3
                         candidates.append((dist, xyz))
 
@@ -1093,19 +1160,90 @@ class DeltaCharucoCalibration(Node):
             return 0.0
         return weighted_score / total_weight
 
-    def pop_next_discovery_candidate(self, candidates, observations, preferred_z_values=None):
-        best_index = None
-        best_score = None
+    def discovery_preferred_z_filter(self, candidates, preferred_z_values):
         preferred = None
         if preferred_z_values:
             preferred = [float(z) for z in preferred_z_values]
             has_preferred = any(
                 (not self.is_in_bad_zone(xyz))
+                and (not self.is_near_accepted_observation(xyz))
                 and any(abs(float(xyz[2]) - z) <= self.discover_z_step_mm() * 0.25 for z in preferred)
                 for xyz in candidates
             )
             if not has_preferred:
                 preferred = None
+        return preferred
+
+    def accepted_discovery_points(self, observations):
+        points = []
+        min_corners = self.discover_min_corners()
+        for obs_xyz, corners in observations:
+            if int(corners) >= min_corners:
+                points.append(np.array(obs_xyz, dtype=float))
+        for item in self.corner_observations:
+            if not bool(item.get('accepted', False)):
+                continue
+            points.append(np.array([
+                float(item['x_mm']),
+                float(item['y_mm']),
+                float(item.get('z_mm', self.discover_z_mm())),
+            ], dtype=float))
+        return points
+
+    def pop_uniform_discovery_candidate(self, candidates, observations, preferred_z_values=None):
+        preferred = self.discovery_preferred_z_filter(candidates, preferred_z_values)
+        bounds = self.workspace_bounds()
+        center = np.array(
+            [
+                (bounds['x_min'] + bounds['x_max']) * 0.5,
+                (bounds['y_min'] + bounds['y_max']) * 0.5,
+                self.discover_z_mm(),
+            ],
+            dtype=float,
+        )
+        accepted_points = self.accepted_discovery_points(observations)
+
+        best_index = None
+        best_score = None
+        for index, xyz in enumerate(candidates):
+            if self.is_in_bad_zone(xyz):
+                continue
+            if self.is_near_accepted_observation(xyz):
+                continue
+            if preferred is not None and not any(
+                abs(float(xyz[2]) - z) <= self.discover_z_step_mm() * 0.25 for z in preferred
+            ):
+                continue
+
+            point = np.array(xyz, dtype=float)
+            center_penalty = float(np.linalg.norm((point - center) / np.array([90.0, 90.0, 80.0])))
+            if not accepted_points:
+                score = -center_penalty
+            else:
+                nearest_mm = min(
+                    math.hypot(
+                        float(point[0] - accepted[0]),
+                        float(point[1] - accepted[1]),
+                    ) + abs(float(point[2] - accepted[2])) * 0.3
+                    for accepted in accepted_points
+                )
+                # Spread accepted samples first, but avoid jumping to extreme corners when distances tie.
+                score = nearest_mm - center_penalty * 2.0
+            if best_score is None or score > best_score:
+                best_score = score
+                best_index = index
+
+        if best_index is None:
+            return None
+        return candidates.pop(best_index)
+
+    def pop_next_discovery_candidate(self, candidates, observations, preferred_z_values=None):
+        if self.discover_sampling_mode() == 'uniform':
+            return self.pop_uniform_discovery_candidate(candidates, observations, preferred_z_values)
+
+        best_index = None
+        best_score = None
+        preferred = self.discovery_preferred_z_filter(candidates, preferred_z_values)
         bounds = self.workspace_bounds()
         center = np.array(
             [
@@ -1117,6 +1255,8 @@ class DeltaCharucoCalibration(Node):
         )
         for index, xyz in enumerate(candidates):
             if self.is_in_bad_zone(xyz):
+                continue
+            if self.is_near_accepted_observation(xyz):
                 continue
             if preferred is not None and not any(
                 abs(float(xyz[2]) - z) <= self.discover_z_step_mm() * 0.25 for z in preferred
@@ -1246,7 +1386,6 @@ class DeltaCharucoCalibration(Node):
                 continue
             probe_index += 1
 
-            image_seq_before_move = self.image_seq
             percent_done = int(round(100.0 * probe_index / max(1, max_probes)))
             self.get_logger().info(
                 'DISCOVERY %s %d/%d (%d%%) accepted=%d/%d rejected=%d bad_zones=%d -> %s mm'
@@ -1276,6 +1415,13 @@ class DeltaCharucoCalibration(Node):
                 current_xyz_mm=xyz.astype(float).tolist(),
                 progress_percent=percent_done,
             )
+            if self.home_before_each_discovery_probe():
+                self.home_and_wait('discovery probe %d' % probe_index)
+                if self.cancel_long_task:
+                    self.get_logger().warning('discovery cancelled while homing before probe %d' % probe_index)
+                    return False
+
+            image_seq_before_move = self.image_seq
             if not self.publish_move(xyz):
                 continue
             self.wait_with_spin(self.move_settle_sec())
@@ -1356,7 +1502,7 @@ class DeltaCharucoCalibration(Node):
             )
             if save_samples:
                 self.save_sample(detection=result.get('detection'))
-                if len(discovered) < target_count:
+                if len(discovered) < target_count and not self.home_before_each_discovery_probe():
                     self.home_and_wait_if_enabled('discovery sample %d' % len(self.samples))
                 self.write_discovery_progress(
                     state='accepted_sample_saved',
@@ -1728,6 +1874,12 @@ class DeltaCharucoCalibration(Node):
         self.camera_matrix = np.array(msg.k, dtype=float).reshape(3, 3)
         self.dist_coeffs = np.array(msg.d, dtype=float).reshape(-1, 1)
 
+    def on_depth_camera_info(self, msg):
+        self.depth_camera_matrix = np.array(msg.k, dtype=float).reshape(3, 3)
+
+    def on_depth(self, msg):
+        self.latest_depth_msg = msg
+
     def on_delta_move(self, msg):
         self.delta_xyz_mm = np.array([msg.x, msg.y, msg.z], dtype=float)
 
@@ -1749,7 +1901,7 @@ class DeltaCharucoCalibration(Node):
 
         self.latest_image = image
         self.image_seq += 1
-        self.latest_detection = self.detect_charuco(image, msg.header.frame_id)
+        self.latest_detection = self.detect_charuco(image, msg.header.frame_id, msg.header.stamp)
         if self.latest_detection is not None:
             self.latest_detection_seq = self.image_seq
         self.publish_debug_image(msg.header)
@@ -1786,9 +1938,46 @@ class DeltaCharucoCalibration(Node):
                         f'corners: {corner_count}  (>={min_corners} ok, more is better)',
             f'camera_xyz_m: {np.round(camera_xyz_m, 4).tolist()}',
                         f'delta_xyz_mm: {np.round(self.delta_xyz_mm, 1).tolist()}',
-                        f'samples saved: {len(self.samples)}',
+            f'samples saved: {len(self.samples)}',
         ]
-        if self.validation_transform is not None:
+        depth_validation = self.latest_detection.get('depth_validation') if self.latest_detection else None
+        if depth_validation:
+            if depth_validation.get('ok'):
+                lines.append(
+                    'depth-vs-pnp: corners=%d mean=%.2fmm rmse=%.2fmm max=%.2fmm'
+                    % (
+                        int(depth_validation['count']),
+                        float(depth_validation['mean_norm_m']) * 1000.0,
+                        float(depth_validation['rmse_norm_m']) * 1000.0,
+                        float(depth_validation['max_norm_m']) * 1000.0,
+                    )
+                )
+                lines.append(
+                    'board-origin depth-PnP: %s mm | norm=%.2fmm'
+                    % (
+                        np.round(np.array(depth_validation['depth_board_origin_minus_pnp_m']) * 1000.0, 2).tolist(),
+                        float(depth_validation['depth_board_origin_error_norm_m']) * 1000.0,
+                    )
+                )
+            else:
+                lines.append('depth-vs-pnp: ' + str(depth_validation.get('reason', 'not available')))
+        if self.validation_planar_model:
+            coeffs = np.array(self.validation_planar_model['coeffs'], dtype=float)
+            camera_h = np.append(camera_xyz_m.reshape(3), 1.0)
+            predicted_xy_m = camera_h @ coeffs
+            predicted_mm = np.array([
+                predicted_xy_m[0] * 1000.0,
+                predicted_xy_m[1] * 1000.0,
+                float(self.validation_planar_model.get('delta_z_m', 0.0)) * 1000.0,
+            ])
+            error_mm = predicted_mm[:2] - self.delta_xyz_mm[:2]
+            error_norm = float(np.linalg.norm(error_mm))
+            lines.extend([
+                f'predicted_delta_xy_mm: {np.round(predicted_mm[:2], 1).tolist()}',
+                f'validation_xy_error_mm: {np.round(error_mm, 1).tolist()} | norm={error_norm:.1f}',
+            ])
+            self.publish_predicted_delta(predicted_mm / 1000.0)
+        elif self.validation_transform is not None:
             camera_h = np.append(camera_xyz_m.reshape(3), 1.0)
             predicted_m = (self.validation_transform @ camera_h)[:3]
             predicted_mm = predicted_m * 1000.0
@@ -1811,7 +2000,7 @@ class DeltaCharucoCalibration(Node):
         msg.point.z = float(predicted_m[2])
         self.predicted_delta_pub.publish(msg)
 
-    def detect_charuco(self, image, frame_id):
+    def detect_charuco(self, image, frame_id, stamp):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         charuco_corners, charuco_ids, marker_corners, marker_ids = self.detector.detectBoard(gray)
         min_corners = int(self.get_parameter('min_charuco_corners').value)
@@ -1882,7 +2071,7 @@ class DeltaCharucoCalibration(Node):
             }
             return None
 
-        return {
+        detection = {
             'rvec': rvec.reshape(3, 1),
             'tvec': tvec.reshape(3, 1),
             'corner_count': len(ids),
@@ -1893,6 +2082,144 @@ class DeltaCharucoCalibration(Node):
             'marker_corners': marker_corners,
             'marker_ids': marker_ids,
             'frame_id': frame_id,
+        }
+        detection['depth_validation'] = self.compare_pnp_and_depth(
+            image.shape[:2], frame_id, stamp, ids, image_points, object_points, rvec, tvec
+        )
+        return detection
+
+    @staticmethod
+    def stamp_to_sec(stamp):
+        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+    def depth_image_to_meters(self, msg):
+        image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        if image.ndim != 2:
+            raise RuntimeError('depth image must be single-channel')
+        if msg.encoding in ('16UC1', 'mono16'):
+            return image.astype(np.float32) / 1000.0
+        if msg.encoding in ('32FC1', '32FC'):
+            return image.astype(np.float32)
+        raise RuntimeError('unsupported depth encoding: %s' % msg.encoding)
+
+    def depth_at_pixel(self, depth_m, u, v):
+        radius = max(0, int(self.get_parameter('depth_validation_window_px').value) // 2)
+        center_u = int(round(float(u)))
+        center_v = int(round(float(v)))
+        height, width = depth_m.shape[:2]
+        if center_u < 0 or center_u >= width or center_v < 0 or center_v >= height:
+            return None
+        x0, x1 = max(0, center_u - radius), min(width, center_u + radius + 1)
+        y0, y1 = max(0, center_v - radius), min(height, center_v + radius + 1)
+        values = depth_m[y0:y1, x0:x1].reshape(-1)
+        valid = values[np.isfinite(values)]
+        valid = valid[(valid >= float(self.get_parameter('depth_validation_min_m').value)) &
+                      (valid <= float(self.get_parameter('depth_validation_max_m').value))]
+        if valid.size == 0:
+            return None
+        return float(np.median(valid))
+
+    def compare_pnp_and_depth(self, image_shape, color_frame_id, color_stamp, ids, image_points,
+                              object_points, rvec, tvec):
+        """Compare PnP corner positions with aligned-depth reconstruction without affecting PnP."""
+        if not bool(self.get_parameter('depth_validation_enabled').value):
+            return {'ok': False, 'reason': 'disabled'}
+        if self.latest_depth_msg is None or self.depth_camera_matrix is None:
+            return {'ok': False, 'reason': 'waiting for aligned depth image/camera info'}
+        depth_msg = self.latest_depth_msg
+        age_sec = abs(self.stamp_to_sec(color_stamp) - self.stamp_to_sec(depth_msg.header.stamp))
+        if age_sec > float(self.get_parameter('depth_validation_max_age_sec').value):
+            return {'ok': False, 'reason': 'depth frame age %.3fs exceeds limit' % age_sec}
+        try:
+            depth_m = self.depth_image_to_meters(depth_msg)
+        except Exception as exc:
+            return {'ok': False, 'reason': 'depth conversion failed: %s' % exc}
+
+        color_height, color_width = image_shape
+        depth_height, depth_width = depth_m.shape[:2]
+        if (color_width, color_height) != (depth_width, depth_height):
+            return {
+                'ok': False,
+                'reason': 'registered depth size %dx%d differs from RGB %dx%d' % (
+                    depth_width, depth_height, color_width, color_height
+                ),
+            }
+        if color_frame_id and depth_msg.header.frame_id and color_frame_id != depth_msg.header.frame_id:
+            return {
+                'ok': False,
+                'reason': 'RGB/depth frame mismatch: %s vs %s' % (
+                    color_frame_id, depth_msg.header.frame_id
+                ),
+            }
+
+        rotation, _ = cv2.Rodrigues(rvec)
+        board_points = object_points.reshape(-1, 3).astype(float)
+        pnp_points = (rotation @ board_points.T).T + tvec.reshape(1, 3)
+        pixels = image_points.reshape(-1, 2)
+        fx, fy = float(self.depth_camera_matrix[0, 0]), float(self.depth_camera_matrix[1, 1])
+        cx, cy = float(self.depth_camera_matrix[0, 2]), float(self.depth_camera_matrix[1, 2])
+        if fx == 0.0 or fy == 0.0:
+            return {'ok': False, 'reason': 'invalid aligned-depth camera intrinsics'}
+
+        comparisons = []
+        errors = []
+        valid_board_points = []
+        valid_depth_points = []
+        for corner_index, (corner_id, pixel, pnp_point) in enumerate(zip(ids, pixels, pnp_points)):
+            depth_value = self.depth_at_pixel(depth_m, pixel[0], pixel[1])
+            if depth_value is None:
+                continue
+            depth_point = np.array([
+                (float(pixel[0]) - cx) * depth_value / fx,
+                (float(pixel[1]) - cy) * depth_value / fy,
+                depth_value,
+            ], dtype=float)
+            error = depth_point - pnp_point
+            errors.append(error)
+            valid_board_points.append(board_points[corner_index])
+            valid_depth_points.append(depth_point)
+            comparisons.append({
+                'corner_id': int(corner_id),
+                'pixel_uv': [float(pixel[0]), float(pixel[1])],
+                'pnp_camera_xyz_m': pnp_point.astype(float).tolist(),
+                'depth_camera_xyz_m': depth_point.astype(float).tolist(),
+                'depth_m': float(depth_value),
+                'depth_minus_pnp_m': error.astype(float).tolist(),
+                'error_norm_m': float(np.linalg.norm(error)),
+            })
+        if not errors:
+            return {'ok': False, 'reason': 'no valid depth at detected ChArUco corners'}
+
+        error_array = np.asarray(errors, dtype=float)
+        norms = np.linalg.norm(error_array, axis=1)
+        # The rigid fit uses board-frame 3D corner coordinates and depth-reconstructed
+        # 3D corner coordinates. Its translation is the board origin from the depth route.
+        board_for_depth = np.asarray(valid_board_points, dtype=float)
+        depth_for_board = np.asarray(valid_depth_points, dtype=float)
+        if board_for_depth.shape[0] < 4:
+            return {'ok': False, 'reason': 'fewer than four valid depth corners'}
+        depth_rotation, depth_origin = fit_rigid_transform(board_for_depth, depth_for_board)
+        depth_fit = (depth_rotation @ board_for_depth.T).T + depth_origin
+        depth_fit_errors = np.linalg.norm(depth_fit - depth_for_board, axis=1)
+        origin_difference = depth_origin - tvec.reshape(3)
+        return {
+            'ok': True,
+            'color_frame_id': color_frame_id,
+            'depth_frame_id': depth_msg.header.frame_id,
+            'frame_age_sec': float(age_sec),
+            'count': int(len(comparisons)),
+            'mean_signed_error_m': np.mean(error_array, axis=0).astype(float).tolist(),
+            'rmse_xyz_m': np.sqrt(np.mean(error_array ** 2, axis=0)).astype(float).tolist(),
+            'mean_norm_m': float(np.mean(norms)),
+            'median_norm_m': float(np.median(norms)),
+            'rmse_norm_m': float(np.sqrt(np.mean(norms ** 2))),
+            'max_norm_m': float(np.max(norms)),
+            'pnp_board_origin_camera_m': tvec.reshape(3).astype(float).tolist(),
+            'depth_board_origin_camera_m': depth_origin.astype(float).tolist(),
+            'depth_board_origin_minus_pnp_m': origin_difference.astype(float).tolist(),
+            'depth_board_origin_error_norm_m': float(np.linalg.norm(origin_difference)),
+            'depth_board_rigid_fit_rmse_m': float(np.sqrt(np.mean(depth_fit_errors ** 2))),
+            'corners': comparisons,
         }
 
     def publish_board_pose(self, header, detection):
@@ -1936,6 +2263,7 @@ class DeltaCharucoCalibration(Node):
                 self.latest_detection['tvec'],
                 0.05,
             )
+            self.draw_delta_axis_overlay(debug, self.latest_detection)
             text = 'ChArUco OK corners=%d' % int(self.latest_detection['corner_count'])
             color = (0, 220, 0)
         else:
@@ -1955,12 +2283,45 @@ class DeltaCharucoCalibration(Node):
             2,
             cv2.LINE_AA,
         )
+        self.draw_discovery_progress_overlay(debug)
         try:
             msg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
             msg.header = header
             self.debug_image_pub.publish(msg)
         except Exception as exc:
             self.get_logger().warning(f'failed to publish debug image: {exc}')
+
+    def draw_discovery_progress_overlay(self, image):
+        progress = self.discovery_progress
+        if not progress:
+            return
+        accepted = int(progress.get('accepted', 0))
+        target = int(progress.get('target_waypoints', 0))
+        rejected = int(progress.get('rejected', 0))
+        probed = int(progress.get('probed', 0))
+        state = str(progress.get('state', 'waiting'))
+        xyz = np.array(progress.get('current_xyz_mm', self.delta_xyz_mm), dtype=float)
+        lines = [
+            'Sampling: %s  accepted %d/%d  rejected %d  probed %d' % (
+                state, accepted, target, rejected, probed
+            ),
+            'Delta target mm: %s' % np.round(xyz, 1).tolist(),
+        ]
+        if self.latest_detection is not None:
+            comparison = self.latest_detection.get('depth_validation')
+            if comparison and comparison.get('ok'):
+                lines.append(
+                    'Depth-PnP origin error: %.2f mm' % (
+                        float(comparison['depth_board_origin_error_norm_m']) * 1000.0
+                    )
+                )
+        y = 55
+        for line in lines:
+            cv2.putText(
+                image, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (20, 235, 235), 2, cv2.LINE_AA,
+            )
+            y += 24
 
     def draw_detection_overlay(self, image, detection):
         marker_corners = detection.get('marker_corners')
@@ -2028,6 +2389,123 @@ class DeltaCharucoCalibration(Node):
                     cv2.LINE_AA,
                 )
 
+    def project_camera_point_to_pixel(self, camera_xyz_m):
+        if self.camera_matrix is None:
+            return None
+        point = np.asarray(camera_xyz_m, dtype=float).reshape(3)
+        if point[2] <= 1e-6:
+            return None
+        fx = float(self.camera_matrix[0, 0])
+        fy = float(self.camera_matrix[1, 1])
+        cx = float(self.camera_matrix[0, 2])
+        cy = float(self.camera_matrix[1, 2])
+        return np.array([
+            fx * point[0] / point[2] + cx,
+            fy * point[1] / point[2] + cy,
+        ], dtype=float)
+
+    def delta_axis_endpoint_pixels(self, camera_xyz_m, delta_step_mm=10.0):
+        origin_px = self.project_camera_point_to_pixel(camera_xyz_m)
+        if origin_px is None:
+            return None
+        step_m = float(delta_step_mm) / 1000.0
+        endpoints = {}
+
+        if self.validation_planar_model:
+            coeffs = np.array(self.validation_planar_model['coeffs'], dtype=float)
+            if coeffs.shape == (4, 2):
+                # delta_xy = [camera_x, camera_y, camera_z, 1] @ coeffs.
+                # Hold camera_z fixed and solve the local camera XY change for +Delta X/Y.
+                jacobian_xy = coeffs[:2, :].T
+                for label, desired_delta in (
+                    ('+X', np.array([step_m, 0.0], dtype=float)),
+                    ('+Y', np.array([0.0, step_m], dtype=float)),
+                ):
+                    try:
+                        camera_dxy = np.linalg.solve(jacobian_xy, desired_delta)
+                    except np.linalg.LinAlgError:
+                        continue
+                    endpoint_camera = np.asarray(camera_xyz_m, dtype=float).reshape(3).copy()
+                    endpoint_camera[0] += float(camera_dxy[0])
+                    endpoint_camera[1] += float(camera_dxy[1])
+                    endpoint_px = self.project_camera_point_to_pixel(endpoint_camera)
+                    if endpoint_px is not None:
+                        endpoints[label] = endpoint_px
+        elif self.validation_transform is not None:
+            try:
+                inv_transform = np.linalg.inv(self.validation_transform)
+                camera_h = np.append(np.asarray(camera_xyz_m, dtype=float).reshape(3), 1.0)
+                delta_origin_m = (self.validation_transform @ camera_h)[:3]
+                for label, desired_delta in (
+                    ('+X', np.array([step_m, 0.0, 0.0], dtype=float)),
+                    ('+Y', np.array([0.0, step_m, 0.0], dtype=float)),
+                ):
+                    endpoint_delta = delta_origin_m + desired_delta
+                    endpoint_camera = (inv_transform @ np.append(endpoint_delta, 1.0))[:3]
+                    endpoint_px = self.project_camera_point_to_pixel(endpoint_camera)
+                    if endpoint_px is not None:
+                        endpoints[label] = endpoint_px
+            except np.linalg.LinAlgError:
+                pass
+
+        if not endpoints:
+            return None
+        return origin_px, endpoints
+
+    def draw_delta_axis_overlay(self, image, detection):
+        camera_xyz_m = detection['tvec'].reshape(3).astype(float)
+        base_x = 12
+        base_y = 58
+        lines = [
+            'Delta XYZ mm: %s' % np.round(self.delta_xyz_mm, 1).tolist(),
+            'Manual correction: +X red, +Y green',
+        ]
+        if self.validation_planar_model:
+            coeffs = np.array(self.validation_planar_model['coeffs'], dtype=float)
+            predicted_xy_m = np.append(camera_xyz_m, 1.0) @ coeffs
+            lines.append('Pred delta XY mm: %s' % np.round(predicted_xy_m * 1000.0, 1).tolist())
+        elif self.validation_transform is None:
+            lines.append('Axis arrows need a loaded hand-eye model')
+
+        for index, line in enumerate(lines):
+            y = base_y + index * 24
+            cv2.putText(image, line, (base_x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(image, line, (base_x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
+
+        axes = self.delta_axis_endpoint_pixels(camera_xyz_m, delta_step_mm=10.0)
+        if axes is None:
+            return
+        origin_px, endpoints = axes
+        origin = tuple(np.round(origin_px).astype(int).tolist())
+        cv2.circle(image, origin, 7, (255, 255, 255), -1)
+        cv2.circle(image, origin, 7, (0, 0, 0), 2)
+        for label, color in (('+X', (0, 0, 255)), ('+Y', (0, 220, 0))):
+            endpoint_px = endpoints.get(label)
+            if endpoint_px is None:
+                continue
+            endpoint = tuple(np.round(endpoint_px).astype(int).tolist())
+            cv2.arrowedLine(image, origin, endpoint, color, 3, cv2.LINE_AA, tipLength=0.22)
+            cv2.putText(
+                image,
+                label,
+                (endpoint[0] + 6, endpoint[1] - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 0),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                image,
+                label,
+                (endpoint[0] + 6, endpoint[1] - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+
     @staticmethod
     def rotation_matrix_to_quaternion(r_mat):
         trace = np.trace(r_mat)
@@ -2082,20 +2560,90 @@ class DeltaCharucoCalibration(Node):
             'max_reprojection_error_px': float(detection.get('max_reprojection_error_px', 0.0)),
         }
         self.samples.append(sample)
-        self.log_box(
-            f'SAVED SAMPLE {len(self.samples)}',
-            [
-                'camera_m: %s' % (
-                    np.round(camera_xyz_m, 4).tolist(),
-                ),
-                'delta_mm: %s' % (
-                    np.round(self.delta_xyz_mm, 1).tolist(),
-                ),
-                f'corners: {sample["corner_count"]}',
-                'move to the next pose, wait until stable, then press SPACE again',
-            ],
-        )
+        depth_validation = detection.get('depth_validation')
+        if depth_validation and depth_validation.get('ok'):
+            self.depth_validation_samples.append({
+                'sample_index': int(len(self.samples)),
+                'delta_xyz_mm': self.delta_xyz_mm.astype(float).tolist(),
+                'pnp_board_origin_camera_m': camera_xyz_m.tolist(),
+                'pnp_reprojection_error_px': float(detection.get('mean_reprojection_error_px', 0.0)),
+                'depth_vs_pnp': depth_validation,
+            })
+            self.save_depth_validation_report()
+        saved_lines = [
+            'camera_mm: %s' % np.round(camera_xyz_m * 1000.0, 1).tolist(),
+            'delta_mm: %s' % np.round(self.delta_xyz_mm, 1).tolist(),
+            f'corners: {sample["corner_count"]}',
+            (
+                'depth-vs-pnp rmse: %.2f mm (%d corners)'
+                % (
+                    float(depth_validation['rmse_norm_m']) * 1000.0,
+                    int(depth_validation['count']),
+                )
+                if depth_validation and depth_validation.get('ok') else
+                'depth-vs-pnp: unavailable for this frame'
+            ),
+        ]
+        if (
+            depth_validation and depth_validation.get('ok') and
+            bool(self.get_parameter('depth_validation_log_corners').value)
+        ):
+            saved_lines.append(
+                'PnP board origin mm: %s'
+                % np.round(np.array(depth_validation['pnp_board_origin_camera_m']) * 1000.0, 2).tolist()
+            )
+            saved_lines.append(
+                'Depth board origin mm: %s | depth-PnP=%s mm'
+                % (
+                    np.round(np.array(depth_validation['depth_board_origin_camera_m']) * 1000.0, 2).tolist(),
+                    np.round(np.array(depth_validation['depth_board_origin_minus_pnp_m']) * 1000.0, 2).tolist(),
+                )
+            )
+            saved_lines.append('per-corner: id pixel_uv | PnP_xyz_mm | Depth_xyz_mm | depth-PnP_mm')
+            for item in depth_validation['corners']:
+                saved_lines.append(
+                    '%02d %s | %s | %s | %s | norm=%.2fmm'
+                    % (
+                        int(item['corner_id']),
+                        np.round(item['pixel_uv'], 1).tolist(),
+                        np.round(np.array(item['pnp_camera_xyz_m']) * 1000.0, 1).tolist(),
+                        np.round(np.array(item['depth_camera_xyz_m']) * 1000.0, 1).tolist(),
+                        np.round(np.array(item['depth_minus_pnp_m']) * 1000.0, 1).tolist(),
+                        float(item['error_norm_m']) * 1000.0,
+                    )
+                )
+        saved_lines.append('move to the next pose, wait until stable, then press SPACE again')
+        self.log_box(f'SAVED SAMPLE {len(self.samples)}', saved_lines)
         return True
+
+    def save_depth_validation_report(self):
+        path = Path(os.path.expanduser(str(self.get_parameter('depth_validation_path').value)))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        summary = []
+        for item in self.depth_validation_samples:
+            comparison = item['depth_vs_pnp']
+            summary.append({
+                'sample_index': int(item['sample_index']),
+                'delta_xyz_mm': item['delta_xyz_mm'],
+                'corner_count': int(comparison['count']),
+                'mean_norm_mm': float(comparison['mean_norm_m']) * 1000.0,
+                'rmse_norm_mm': float(comparison['rmse_norm_m']) * 1000.0,
+                'max_norm_mm': float(comparison['max_norm_m']) * 1000.0,
+            })
+        data = {
+            'description': (
+                'Per-corner comparison for the same ChArUco frame: PnP RGB coordinates versus '
+                'coordinates reconstructed from registered depth. This is diagnostic only; the '
+                'hand-eye calibration samples remain PnP-based.'
+            ),
+            'coordinate_frame': 'camera_color_optical_frame',
+            'sample_count': int(len(self.depth_validation_samples)),
+            'sample_summary': summary,
+            'samples': self.depth_validation_samples,
+        }
+        with path.open('w', encoding='utf-8') as file:
+            yaml.safe_dump(data, file, sort_keys=False, allow_unicode=True)
+        self.get_logger().info('saved depth-vs-PnP validation: %s' % path)
 
     def save_manual_rotation_sample(self):
         if self.latest_detection is None:
@@ -2127,7 +2675,7 @@ class DeltaCharucoCalibration(Node):
             f'SAVED MANUAL ROTATION SAMPLE {sample["index"]}',
             [
                 'delta held at mm: %s' % np.round(self.delta_xyz_mm, 1).tolist(),
-                'board_tvec_camera_m: %s' % np.round(tvec, 4).tolist(),
+                'board_tvec_camera_mm: %s' % np.round(tvec * 1000.0, 1).tolist(),
                 'board_rvec_camera: %s' % np.round(rvec, 4).tolist(),
                 f'corners: {sample["corner_count"]}',
                 'rotate the board again and press v to record another pose',
@@ -2173,10 +2721,10 @@ class DeltaCharucoCalibration(Node):
             return
         for index, sample in enumerate(self.samples, start=1):
             self.get_logger().info(
-                '%02d camera_m=%s delta_mm=%s corners=%d'
+                '%02d camera_mm=%s delta_mm=%s corners=%d'
                 % (
                     index,
-                    np.round(sample['camera_xyz_m'], 4).tolist(),
+                    np.round(np.array(sample['camera_xyz_m'], dtype=float) * 1000.0, 1).tolist(),
                     np.round(sample['delta_xyz_mm'], 1).tolist(),
                     sample['corner_count'],
                 )
@@ -2306,6 +2854,139 @@ class DeltaCharucoCalibration(Node):
                 'calibration RMSE %.2f mm is above 5.00 mm; inspect mechanics, pose diversity, board visibility, and outliers'
                 % (result['error']['rmse_m'] * 1000.0)
             )
+        self.compute_and_save_dual_models()
+        return True
+
+    @staticmethod
+    def point_plane_error(points):
+        """Fit a 3D plane and return its centroid, normal, and point distances."""
+        points = np.asarray(points, dtype=float)
+        centroid = np.mean(points, axis=0)
+        _u, _singular, vh = np.linalg.svd(points - centroid, full_matrices=False)
+        normal = vh[-1]
+        distances = np.abs((points - centroid) @ normal)
+        return centroid, normal, distances
+
+    @staticmethod
+    def error_summary(errors_m):
+        errors_m = np.asarray(errors_m, dtype=float)
+        return {
+            'count': int(len(errors_m)),
+            'rmse_m': float(np.sqrt(np.mean(errors_m ** 2))),
+            'mean_m': float(np.mean(errors_m)),
+            'median_m': float(np.median(errors_m)),
+            'max_m': float(np.max(errors_m)),
+            'per_sample_m': errors_m.astype(float).tolist(),
+        }
+
+    def compute_and_save_dual_models(self):
+        """Write PnP/depth one-layer models and their direct cross-checks."""
+        depth_by_index = {
+            int(item['sample_index']): item
+            for item in self.depth_validation_samples
+            if item.get('depth_vs_pnp', {}).get('ok')
+        }
+        rows = []
+        for index, sample in enumerate(self.samples, start=1):
+            depth_record = depth_by_index.get(index)
+            if depth_record is None:
+                continue
+            comparison = depth_record['depth_vs_pnp']
+            rows.append({
+                'sample_index': index,
+                'delta_xyz_m': np.array(sample['delta_xyz_m'], dtype=float),
+                'pnp_camera_xyz_m': np.array(sample['camera_xyz_m'], dtype=float),
+                'depth_camera_xyz_m': np.array(comparison['depth_board_origin_camera_m'], dtype=float),
+                'corner_count': int(sample['corner_count']),
+                'depth_corner_count': int(comparison['count']),
+                'depth_board_origin_minus_pnp_m': np.array(
+                    comparison['depth_board_origin_minus_pnp_m'], dtype=float
+                ),
+            })
+        if len(rows) < 4:
+            self.get_logger().warning(
+                'dual PnP/depth models not saved: need 4 paired samples, got %d' % len(rows)
+            )
+            return False
+
+        delta_points = np.array([row['delta_xyz_m'] for row in rows], dtype=float)
+        pnp_points = np.array([row['pnp_camera_xyz_m'] for row in rows], dtype=float)
+        depth_points = np.array([row['depth_camera_xyz_m'] for row in rows], dtype=float)
+        pnp_coeffs, pnp_prediction, pnp_errors = fit_affine(pnp_points, delta_points[:, :2])
+        depth_coeffs, depth_prediction, depth_errors = fit_affine(depth_points, delta_points[:, :2])
+        pnp_cross_errors = np.linalg.norm(depth_points @ pnp_coeffs[:3, :] + pnp_coeffs[3, :] - delta_points[:, :2], axis=1)
+        depth_cross_errors = np.linalg.norm(pnp_points @ depth_coeffs[:3, :] + depth_coeffs[3, :] - delta_points[:, :2], axis=1)
+        pnp_plane_center, pnp_plane_normal, pnp_plane_errors = self.point_plane_error(pnp_points)
+        depth_plane_center, depth_plane_normal, depth_plane_errors = self.point_plane_error(depth_points)
+
+        sample_rows = []
+        for row, pnp_pred, depth_pred, pnp_error, depth_error, pnp_cross, depth_cross, pnp_plane, depth_plane in zip(
+            rows, pnp_prediction, depth_prediction, pnp_errors, depth_errors, pnp_cross_errors,
+            depth_cross_errors, pnp_plane_errors, depth_plane_errors,
+        ):
+            sample_rows.append({
+                'sample_index': int(row['sample_index']),
+                'delta_xyz_mm': (row['delta_xyz_m'] * 1000.0).tolist(),
+                'pnp_camera_xyz_mm': (row['pnp_camera_xyz_m'] * 1000.0).tolist(),
+                'depth_camera_xyz_mm': (row['depth_camera_xyz_m'] * 1000.0).tolist(),
+                'depth_origin_minus_pnp_mm': (row['depth_board_origin_minus_pnp_m'] * 1000.0).tolist(),
+                'corner_count': int(row['corner_count']),
+                'depth_corner_count': int(row['depth_corner_count']),
+                'pnp_model_delta_xy_mm': (pnp_pred * 1000.0).tolist(),
+                'depth_model_delta_xy_mm': (depth_pred * 1000.0).tolist(),
+                'pnp_model_xy_error_mm': float(pnp_error * 1000.0),
+                'depth_model_xy_error_mm': float(depth_error * 1000.0),
+                'pnp_model_on_depth_xy_error_mm': float(pnp_cross * 1000.0),
+                'depth_model_on_pnp_xy_error_mm': float(depth_cross * 1000.0),
+                'pnp_plane_error_mm': float(pnp_plane * 1000.0),
+                'depth_plane_error_mm': float(depth_plane * 1000.0),
+            })
+
+        result = {
+            'description': (
+                'One-layer dual hand-eye diagnostic. Both models map camera XYZ to Delta XY. '
+                'PnP uses ChArUco pose; depth uses ChArUco corners reconstructed through '
+                'the RGB-aligned depth image.'
+            ),
+            'camera_frame': 'camera_color_optical_frame',
+            'delta_z_m': float(np.median(delta_points[:, 2])),
+            'paired_sample_count': int(len(rows)),
+            'pnp_model_camera_xyz_to_delta_xy': {
+                'coeffs': pnp_coeffs.tolist(),
+                'self_fit_error': self.error_summary(pnp_errors),
+                'cross_fit_on_depth_points_error': self.error_summary(pnp_cross_errors),
+            },
+            'depth_model_camera_xyz_to_delta_xy': {
+                'coeffs': depth_coeffs.tolist(),
+                'self_fit_error': self.error_summary(depth_errors),
+                'cross_fit_on_pnp_points_error': self.error_summary(depth_cross_errors),
+            },
+            'pnp_points_plane': {
+                'centroid_camera_m': pnp_plane_center.tolist(),
+                'normal_camera': pnp_plane_normal.tolist(),
+                'error': self.error_summary(pnp_plane_errors),
+            },
+            'depth_points_plane': {
+                'centroid_camera_m': depth_plane_center.tolist(),
+                'normal_camera': depth_plane_normal.tolist(),
+                'error': self.error_summary(depth_plane_errors),
+            },
+            'samples': sample_rows,
+        }
+        path = Path(os.path.expanduser(str(self.get_parameter('dual_calibration_path').value)))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('w', encoding='utf-8') as file:
+            yaml.safe_dump(result, file, sort_keys=False, allow_unicode=True)
+        self.get_logger().info('saved dual PnP/depth calibration report: %s' % path)
+        self.get_logger().info(
+            'dual self-fit RMSE: PnP=%.3f mm, depth=%.3f mm; cross: PnP-on-depth=%.3f mm, depth-on-PnP=%.3f mm'
+            % (
+                result['pnp_model_camera_xyz_to_delta_xy']['self_fit_error']['rmse_m'] * 1000.0,
+                result['depth_model_camera_xyz_to_delta_xy']['self_fit_error']['rmse_m'] * 1000.0,
+                result['pnp_model_camera_xyz_to_delta_xy']['cross_fit_on_depth_points_error']['rmse_m'] * 1000.0,
+                result['depth_model_camera_xyz_to_delta_xy']['cross_fit_on_pnp_points_error']['rmse_m'] * 1000.0,
+            )
+        )
         return True
 
     def write_debug_image(self):

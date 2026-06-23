@@ -1,0 +1,403 @@
+#include <Arduino.h>
+
+#include "config.h"
+#include "pinout.h"
+#include "logger.h"
+#include "robotGeometry.h"
+#include "interpolation.h"
+#include "fanControl.h"
+#include "RampsStepper.h"
+#include "queue.h"
+#include "command.h"
+#include "byj_gripper.h"
+#include "equipment.h"
+#include "endstop.h"
+
+// --------------- 传送带相关配置 -----start----------------
+// 步进电机引脚定义
+const int motorDirPin = 15;      // 方向控制引脚
+const int motorStepPin = 2;      // 步进控制引脚(必须支持PWM)
+const int motorEnablePin = 4;    // 使能控制引脚(LOW使能，HIGH禁用)
+// LEDC PWM配置
+const int pwmChannel = 0;        // 使用LEDC通道0
+const int pwmResolution = 8;     // 8位分辨率(实际不使用占空比控制)
+// 速度配置(脉冲频率Hz)
+const int speedLow = 200;        // 低速(200Hz)
+const int speedMedium = 500;     // 中速(500Hz)
+const int speedHigh = 1000;      // 高速(1000Hz)
+// --------------- 传送带相关配置 -----stop----------------
+
+// --------------- 电磁阀相关配置 -----start----------------
+const int solenoidPwmChannel = 4;  // 使用不同的通道，不与 motor 冲突
+const int solenoidPwmFreq = 50;    // 50Hz 更适合电磁阀
+const int solenoidPwmResolution = 16;
+// --------------- 电磁阀相关配置 -----stop----------------
+
+// 当前状态
+int currentSpeed = 0;
+bool currentDirection = false;
+
+// 步进引脚设定
+RampsStepper stepperHigher(X_STEP_PIN, X_DIR_PIN, X_ENABLE_PIN, INVERSE_X_STEPPER);
+RampsStepper stepperLower(Y_STEP_PIN, Y_DIR_PIN, Y_ENABLE_PIN, INVERSE_Y_STEPPER);
+RampsStepper stepperRotate(Z_STEP_PIN, Z_DIR_PIN, Z_ENABLE_PIN, INVERSE_Z_STEPPER);
+
+//限位开关设定
+Endstop endstopX(X_MIN_PIN, X_DIR_PIN, X_STEP_PIN, X_ENABLE_PIN, X_MIN_INPUT, X_HOME_STEPS, HOME_DWELL);
+Endstop endstopY(Y_MIN_PIN, Y_DIR_PIN, Y_STEP_PIN, Y_ENABLE_PIN, Y_MIN_INPUT, Y_HOME_STEPS, HOME_DWELL);
+Endstop endstopZ(Z_MIN_PIN, Z_DIR_PIN, Z_STEP_PIN, Z_ENABLE_PIN, Z_MIN_INPUT, Z_HOME_STEPS, HOME_DWELL);
+
+// 轨道步进电机设定
+RampsStepper stepperRail(E0_STEP_PIN, E0_DIR_PIN, E0_ENABLE_PIN, INVERSE_E0_STEPPER);
+Endstop endstopE0(E0_MIN_PIN, E0_DIR_PIN, E0_STEP_PIN, E0_ENABLE_PIN, E0_MIN_INPUT, E0_HOME_STEPS, HOME_DWELL);
+
+// 设备对象设定
+Equipment pump(PUMP_PIN);  // 气泵
+// Equipment solenoid_valve(SOLENOID_VALUE_PIN);  // 电磁阀
+// 电磁阀改为pwm控制，因为如果直接使用继电器控制电磁阀会产生反电动势到时42步进电机产生干扰
+// FanControl fan(FAN_PIN, FAN_DELAY);
+
+// 执行与命令对象
+RobotGeometry geometry(END_EFFECTOR_OFFSET, LOW_SHANK_LENGTH, HIGH_SHANK_LENGTH);  // 机器人几何参数
+Interpolation interpolator;  // 插补器
+Queue<Cmd> queue(QUEUE_SIZE);  // 命令队列
+Command command;  // 命令处理器
+
+// 函数声明（放在文件顶部）：
+void homeSequence();
+void setStepperEnable(bool enable);
+void disableSliderMotor();
+void enableSliderMotor();
+void executeCommand(Cmd cmd);
+void handleSliderCommand(int command);
+void handSliderCmd(int command);
+
+void setup() {
+
+  // 1. 打开串口
+  Serial.begin(BAUD);  // 配置在config.h文件中
+  Serial.println("...【www.itprojects.cn delta robot】...");
+  // 这是另外一个串口，用来测试的，可以忽略
+  // Serial1.begin(115200, SERIAL_8N1, 22, 21); // 设置rx为22，tx为21
+  // Serial1.println("you can send data by uart ,rx 22, tx 21 pin...");
+
+  // 2. 将3个步进电机初始化为0°
+  stepperHigher.setPositionRad(0);  // 0°
+  stepperLower.setPositionRad(0);  // 0°
+  stepperRotate.setPositionRad(0);  // 0°
+  // stepperRail.setPosition(0);  // 0°
+
+  // 3. 开机时，是否需要将机械表归零位
+  if (HOME_ON_BOOT) {
+    // 归零处理
+    homeSequence();
+    // Logger::logINFO("www.itprojects.cn DELTA ONLINE");
+  } else {
+    // 机器人开机后，默认不使能3个42步进电机，有可能上位机长时间无任何动作，长时间通电不建议，影响电机寿命
+    setStepperEnable(true);
+  }
+
+  // 4. 初始化插补器
+  interpolator.setInterpolation(INITIAL_X, INITIAL_Y, INITIAL_Z, INITIAL_E0, INITIAL_X, INITIAL_Y, INITIAL_Z, INITIAL_E0);
+
+
+  // --------------- 传送带相关 -----start----------------
+  // 设置电机控制引脚
+  pinMode(motorDirPin, OUTPUT);
+  pinMode(motorEnablePin, OUTPUT);
+  // 配置LEDC PWM
+  ledcSetup(pwmChannel, speedLow, pwmResolution); // 初始频率
+  ledcAttachPin(motorStepPin, pwmChannel);
+  // 初始状态：禁用电机
+  disableSliderMotor();
+  Serial.println("ESP32 Stepper Controller Ready");
+  Serial.println("Commands: 1-3=Forward, 4-6=Reverse, 0=Stop");
+  // --------------- 传送带相关 -----stop----------------
+
+  // --------------- 电磁阀相关 -----start----------------
+  ledcSetup(solenoidPwmChannel, solenoidPwmFreq, solenoidPwmResolution);
+  ledcAttachPin(SOLENOID_VALUE_PIN, solenoidPwmChannel);
+  // --------------- 电磁阀相关 -----stop----------------
+}
+
+void loop() {
+
+  // 1. 插补器更新实际位置
+  interpolator.updateActualPosition();
+  // 2. 设置几何参数
+  geometry.set(interpolator.getXPosmm(), interpolator.getYPosmm(), interpolator.getZPosmm());
+  // 3. 旋转步进电机
+  stepperRotate.stepToPositionRad(geometry.getRotRad());
+  // 4. 下臂步进电机
+  stepperLower.stepToPositionRad(geometry.getLowRad());
+  // 5. 上臂步进电机
+  stepperHigher.stepToPositionRad(geometry.getHighRad());
+
+  // 6. 如果有导轨则进行移动
+  if (RAIL){
+    // 轨道步进电机
+    stepperRail.stepToPositionMM(interpolator.getEPosmm(), STEPS_PER_MM_RAIL);
+  }
+
+  // 7. 更新步电机的位置
+  stepperRotate.update();  // 更新旋转步进电机
+  stepperLower.update();  // 更新下臂步进电机
+  stepperHigher.update();  // 更新上臂步进电机
+  if (RAIL){
+    stepperRail.update();  // 更新轨道步进电机
+  }
+
+  // 8. 如果有风扇，则更新风扇的状态
+  // fan.update();
+
+  // 9. 判断队列是否满，如果不满，则存储
+  if (!queue.isFull()) {
+    if (command.handleGcode()) {
+      Cmd temp = command.getCmd();  // 获取命令
+      queue.push(temp);  // 将命令推入队列
+      // Serial.println("ok\n");
+    }
+  }
+
+  // 10. 如果队列不空，则处理
+  if (!queue.isEmpty()) {
+    if (interpolator.isFinished()) {
+      executeCommand(queue.pop());  // 执行命令
+      if (PRINT_REPLY) {
+        Serial.println(PRINT_REPLY_MSG);
+      }
+    }
+    // delay(500); // 延时0.5秒（500毫秒）
+  }
+
+  // delay(500); // 延时0.5秒（500毫秒）
+}
+
+// 执行解析出的Gcode命令
+void executeCommand(Cmd cmd) {
+
+  if (cmd.id == -1) {
+    printErr();
+    return;
+  }
+
+  // 如果是G开头的命令，一般是移动相关的
+  if (cmd.id == 'G') {
+    switch (cmd.num) {
+    case 0:
+    case 1:
+      // fan.enable(true);
+      Point posoffset;
+      posoffset = interpolator.getPosOffset();
+      cmdMove(cmd, interpolator.getPosmm(), posoffset, command.isRelativeCoord);
+      // Logger::logINFO("cmd.valueF is " + String(cmd.valueF) );
+      // 如果发送的Gcode命令中，包含F那么就表示速度，例如F100则表示1秒钟100mm
+      // G0 X50 F50  其中的含义：相对移动到X50的位置，速度是50mm/s
+      interpolator.setInterpolation(cmd.valueX, cmd.valueY, cmd.valueZ, cmd.valueE, cmd.valueF);
+      //Logger::logINFO("LINEAR MOVE: X" + String(cmd.valueX-posoffset.xmm) + " Y" + String(cmd.valueY-posoffset.ymm) + " Z" + String(cmd.valueZ-posoffset.zmm) + " E" + String(cmd.valueE-posoffset.emm));
+      break;
+    case 4: cmdDwell(cmd); break;  // G4: 延时
+    case 28: homeSequence(); break;  // G28: 归位
+    case 90: command.cmdToAbsolute(); break; // ABSOLUTE COORDINATE MODE  G90: 绝对坐标模式
+    case 91: command.cmdToRelative(); break; // RELATIVE COORDINATE MODE  G91: 相对坐标模式
+    case 92:
+      interpolator.resetPosOffset();
+      cmdMove(cmd, interpolator.getPosmm(), interpolator.getPosOffset(), false);
+      interpolator.setPosOffset(cmd.valueX, cmd.valueY, cmd.valueZ, cmd.valueE);
+      break;
+    default: printErr();
+    }
+  }
+
+  // 如果是M开头的命令，一般是与功能相关
+  else if (cmd.id == 'M') {
+    switch (cmd.num) {
+    case 1: {
+        // 泄气阀 打开，此时泄气压，物体掉落
+        // solenoid_valve.cmdOn(); // 放弃继电器控制的方式
+        // Logger::logINFO("solenoid valve open");
+        // 开电磁阀（强吸力）,此时 气管导通，物体掉落
+        ledcWrite(solenoidPwmChannel, 8192); // 0~65535 之间的值
+      }
+      break;
+    case 2: {
+        // 泄气阀 关闭，此时吸气，物体被吸住
+        // solenoid_valve.cmdOff();
+        // Logger::logINFO("solenoid valve closed");  // 串口通过发送此消息，告诉上位机，已经泄完气体了。不可以放到这里，而是要等到这个命令被执行完才loginfo
+        // 关闭电磁阀
+        ledcWrite(solenoidPwmChannel, 1638);
+      }
+      break;
+    case 3:
+      if (GRIPPER == 0){
+        // byj_gripper.cmdOn();
+        break;
+      } else if (GRIPPER == 1){
+        // servo_gripper.cmdOn();
+        break;
+      }
+    case 5:
+      if (GRIPPER == 0){
+        // byj_gripper.cmdOff();
+        break;
+      } else if (GRIPPER == 1){
+        // servo_gripper.cmdOff();
+        break;
+      }
+    // case 6: laser.cmdOn(); break;
+    // case 7: laser.cmdOff(); break;
+    case 17: setStepperEnable(false); break;  // M17：启用所有轴的使能信号（激活电机）
+    case 18: setStepperEnable(true); break;  // M18：禁用所有轴的使能信号（关闭电机）
+    case 121:
+      {
+        pump.cmdOn();
+        // Logger::logINFO("pump open");
+      };break;  // M121: 打开气泵
+    case 122:
+      {
+        pump.cmdOff();
+        // Logger::logINFO("pump close");
+      };break;  // M122: 关闭气泵
+    // case 123:pump1.cmdOff();pump2.cmdOff();break;
+    // case 124:pump3.cmdOn();pump4.cmdOff();break;
+    // case 125:pump3.cmdOff();pump4.cmdOn();break;
+    // case 126:pump3.cmdOff();pump4.cmdOff();break;
+    case 106:
+      // fan.enable(true);
+      break;
+    case 107:
+      // fan.enable(false);
+      break;
+    case 114: command.cmdGetPosition(interpolator.getPosmm(), interpolator.getPosOffset(), stepperHigher.getPosition(), stepperLower.getPosition(), stepperRotate.getPosition()); break;// Return the current positions of all axis
+    case 119:
+      // Logger::logINFO("ENDSTOP STATE: [UPPER_SHANK(X):"+String(endstopX.state())+" LOWER_SHANK(Y):"+String(endstopY.state())+" ROTATE_GEAR(Z):"+String(endstopZ.state())+"]");
+      break;
+    // --------------- 传送带相关 -----start----------------
+    case 200:
+    case 201:
+    case 202:
+    case 203:
+    case 204:
+    case 205:
+    case 206: handSliderCmd(cmd.num);break;
+    // --------------- 传送带相关 -----stop----------------
+    default: printErr();
+    }
+  }
+  else {
+    printErr();
+  }
+}
+
+// --------------- 传送带相关 -----start----------------
+void handSliderCmd(int command) {
+  if(command == 200) {
+    disableSliderMotor();
+    // Serial.println("Motor STOPPED");
+  }
+  else if(command >= 201 && command <= 206) {
+    handleSliderCommand(command);
+  }
+}
+
+void handleSliderCommand(int command) {
+  // 设置速度和方向
+  switch(command) {
+    case 201: // 正转低速
+      currentSpeed = speedLow;
+      currentDirection = false;
+      break;
+    case 202: // 正转中速
+      currentSpeed = speedMedium;
+      currentDirection = false;
+      break;
+    case 203: // 正转高速
+      currentSpeed = speedHigh;
+      currentDirection = false;
+      break;
+    case 204: // 反转低速
+      currentSpeed = speedLow;
+      currentDirection = true;
+      break;
+    case 205: // 反转中速
+      currentSpeed = speedMedium;
+      currentDirection = true;
+      break;
+    case 206: // 反转高速
+      currentSpeed = speedHigh;
+      currentDirection = true;
+      break;
+  }
+
+  // 启用电机
+  enableSliderMotor();
+
+  // 打印状态
+//   Serial.print("Motor RUNNING ");
+//   Serial.print(currentDirection ? "REVERSE" : "FORWARD");
+//   Serial.print(" at ");
+//   Serial.print(currentSpeed);
+//   Serial.println(" Hz");
+}
+
+void enableSliderMotor() {
+  // 设置方向
+  digitalWrite(motorDirPin, currentDirection);
+
+  // 使能驱动器
+  digitalWrite(motorEnablePin, LOW);
+
+  // 设置PWM频率(50%占空比)
+  ledcWriteTone(pwmChannel, currentSpeed);
+}
+
+void disableSliderMotor() {
+  // 停止PWM输出
+  ledcWrite(pwmChannel, 0);
+
+  // 禁用驱动器
+  digitalWrite(motorEnablePin, HIGH);
+}
+
+// --------------- 传送带相关 -----stop----------------
+
+void setStepperEnable(bool enable){
+  stepperRotate.enable(enable);
+  stepperLower.enable(enable);
+  stepperHigher.enable(enable);
+  if(RAIL){
+    stepperRail.enable(enable);
+  }
+  // fan.enable(enable);
+}
+
+void homeSequence(){
+  setStepperEnable(false);
+  // fan.enable(true);
+
+//   // 依次让步进电机归零
+//   if (HOME_X_STEPPER){
+//     endstopX.home(!INVERSE_Y_STEPPER);
+//   }
+//   if (HOME_Y_STEPPER){
+//     endstopY.home(!INVERSE_X_STEPPER);
+//   }
+//   if (HOME_Z_STEPPER){
+//     endstopZ.home(!INVERSE_Z_STEPPER);
+//   }
+
+    // 废弃依次XYZ轴归零，改为整体归零，因为在某一个轴单独归零的时候，机械臂末端可能被卡主，或者超出了当前另外2个轴时允许的单轴转动的最大角度
+    Endstop::homeAll(endstopX, endstopY, endstopZ, !INVERSE_Y_STEPPER);
+
+  // if (RAIL){
+  //   if (HOME_E0_STEPPER){
+  //     endstopE0.home(!INVERSE_E0_STEPPER); //
+  //   }
+  // }
+
+  // 让插补器也处于归零的状态
+  interpolator.setInterpolation(INITIAL_X, INITIAL_Y, INITIAL_Z, INITIAL_E0, INITIAL_X, INITIAL_Y, INITIAL_Z, INITIAL_E0);
+
+  // 将归位后的位置信息传入插点函数中，初始末尾位置一致，
+  Logger::logINFO("HOMING COMPLETE");
+}
