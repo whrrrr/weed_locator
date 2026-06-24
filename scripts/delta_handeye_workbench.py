@@ -401,6 +401,7 @@ class HandeyeWorkbench:
         self.exec_x = tk.StringVar(value='0.0')
         self.exec_y = tk.StringVar(value='0.0')
         self.exec_z = tk.StringVar(value='0.0')
+        self.exec_speed = tk.StringVar(value='80.0')
         self.manual_x = tk.StringVar(value='0.0')
         self.manual_y = tk.StringVar(value='0.0')
         self.manual_z = tk.StringVar(value='-230.0')
@@ -561,6 +562,10 @@ class HandeyeWorkbench:
         for label, var in [('X 偏移', self.exec_x), ('Y 偏移', self.exec_y), ('Z 偏移', self.exec_z)]:
             ttk.Label(row, text=label).pack(side='left', padx=(8, 0))
             ttk.Entry(row, textvariable=var, width=7).pack(side='left')
+        speed_row = ttk.Frame(parent)
+        speed_row.pack(fill='x', pady=(0, 5))
+        ttk.Label(speed_row, text='机械臂速度 mm/s（固件 F）').pack(side='left')
+        ttk.Entry(speed_row, textvariable=self.exec_speed, width=9).pack(side='left', padx=5)
         ttk.Button(parent, text='保存执行设置', command=self.save_exec_from_ui).pack(anchor='w')
         ttk.Button(parent, text='将当前象棋转换并移动', command=self.start_execute).pack(anchor='w', pady=8)
         ttk.Separator(parent).pack(fill='x', pady=8)
@@ -583,10 +588,15 @@ class HandeyeWorkbench:
         conveyor = ttk.Frame(parent)
         conveyor.pack(fill='x', pady=4)
         ttk.Button(conveyor, text='停止', command=self.start_conveyor_stop).pack(side='left')
-        ttk.Button(conveyor, text='低速', command=lambda: self.start_conveyor_speed('低速', 'M201')).pack(side='left', padx=5)
-        ttk.Button(conveyor, text='中速', command=lambda: self.start_conveyor_speed('中速', 'M202')).pack(side='left', padx=5)
-        ttk.Button(conveyor, text='高速', command=lambda: self.start_conveyor_speed('高速', 'M203')).pack(side='left')
-        ttk.Label(parent, text='当前四键使用固件的正转档位：低/中/高分别为 200/500/1000 Hz。', wraplength=450).pack(anchor='w')
+        ttk.Button(conveyor, text='正转低速', command=lambda: self.start_conveyor_speed('正转', '低速', 'M201')).pack(side='left', padx=5)
+        ttk.Button(conveyor, text='正转中速', command=lambda: self.start_conveyor_speed('正转', '中速', 'M202')).pack(side='left', padx=5)
+        ttk.Button(conveyor, text='正转高速', command=lambda: self.start_conveyor_speed('正转', '高速', 'M203')).pack(side='left')
+        conveyor_reverse = ttk.Frame(parent)
+        conveyor_reverse.pack(fill='x', pady=(0, 4))
+        ttk.Button(conveyor_reverse, text='反转低速', command=lambda: self.start_conveyor_speed('反转', '低速', 'M204')).pack(side='left')
+        ttk.Button(conveyor_reverse, text='反转中速', command=lambda: self.start_conveyor_speed('反转', '中速', 'M205')).pack(side='left', padx=5)
+        ttk.Button(conveyor_reverse, text='反转高速', command=lambda: self.start_conveyor_speed('反转', '高速', 'M206')).pack(side='left')
+        ttk.Label(parent, text='传送带：停止 M200；正转低/中/高 M201/M202/M203；反转低/中/高 M204/M205/M206。', wraplength=450).pack(anchor='w')
         ttk.Label(parent, text='执行采用固定的三段运动：先到 Z=-210 mm，再横移 XY，最后到目标 Z。模型和偏移只从这里的执行设置读取。', wraplength=450).pack(anchor='w')
 
     def choose_yaml(self, variable):
@@ -697,12 +707,19 @@ class HandeyeWorkbench:
         self.exec_x.set(str(offset.get('x', 0.0)))
         self.exec_y.set(str(offset.get('y', 0.0)))
         self.exec_z.set(str(offset.get('z', 0.0)))
+        self.exec_speed.set(str(data.get('arm_feedrate_mm_per_sec', 80.0)))
 
     def save_exec_from_ui(self):
+        speed = as_float(self.exec_speed.get(), -1.0)
+        if speed <= 0.0:
+            messagebox.showerror('执行设置无效', '机械臂速度必须大于 0 mm/s。')
+            return False
         data = {'format': 'delta_handeye_execution_settings/v1', 'model_source': self.exec_model.get(),
-                'offset_mm': {'x': as_float(self.exec_x.get()), 'y': as_float(self.exec_y.get()), 'z': as_float(self.exec_z.get())}}
+                'offset_mm': {'x': as_float(self.exec_x.get()), 'y': as_float(self.exec_y.get()), 'z': as_float(self.exec_z.get())},
+                'arm_feedrate_mm_per_sec': speed}
         write_yaml(self.exec_settings_path.get(), data)
         self.status_var.set('已保存执行设置。')
+        return True
 
     def normalized_layers(self, source_path):
         data = load_yaml(source_path, {})
@@ -870,12 +887,15 @@ class HandeyeWorkbench:
         self.node.send_gcode('M200')
         self.current_status = '已发送传送带停止 M200。'
 
-    def start_conveyor_speed(self, speed_name, gcode):
-        self.start_worker(f'传送带{speed_name}', lambda: self.conveyor_speed_worker(speed_name, gcode))
+    def start_conveyor_speed(self, direction_name, speed_name, gcode):
+        self.start_worker(
+            f'传送带{direction_name}{speed_name}',
+            lambda: self.conveyor_speed_worker(direction_name, speed_name, gcode),
+        )
 
-    def conveyor_speed_worker(self, speed_name, gcode):
+    def conveyor_speed_worker(self, direction_name, speed_name, gcode):
         self.node.send_gcode(gcode)
-        self.current_status = f'已发送传送带正转{speed_name}：{gcode}。'
+        self.current_status = f'已发送传送带{direction_name}{speed_name}：{gcode}。'
 
     def start_collection(self):
         try:
@@ -1649,7 +1669,8 @@ class HandeyeWorkbench:
         if path is None:
             messagebox.showerror('缺少模型', '选择手眼标定结果文件。')
             return
-        self.save_exec_from_ui()
+        if not self.save_exec_from_ui():
+            return
         self.start_worker('转换并执行', self.execute_worker, path)
 
     def current_yolo_xyz_or_wait(self, timeout_sec=5.0):
@@ -1690,7 +1711,7 @@ class HandeyeWorkbench:
             self.current_status = '执行取消：所选模型无效'
             return
         target = np.asarray(target) + np.array([as_float(self.exec_x.get()), as_float(self.exec_y.get()), as_float(self.exec_z.get())])
-        f, travel = 80.0, -210.0
+        f, travel = as_float(self.exec_speed.get(), 80.0), -210.0
         self.node.send_gcode('G90')
         self.node.send_gcode('G1 Z%.2f F%.2f' % (travel, f))
         self.node.send_gcode('G1 X%.2f Y%.2f Z%.2f F%.2f' % (target[0], target[1], travel, f))
@@ -1704,18 +1725,24 @@ class HandeyeWorkbench:
             return
         try:
             target = [float(self.manual_x.get()), float(self.manual_y.get()), float(self.manual_z.get())]
+            speed = float(self.exec_speed.get())
         except ValueError:
-            messagebox.showerror('坐标无效', 'X、Y、Z 都必须是毫米数值。')
+            messagebox.showerror('输入无效', 'X、Y、Z 和机械臂速度都必须是数值。')
             return
-        self.start_worker('手动移动', self.manual_move_worker, target)
+        if speed <= 0.0:
+            messagebox.showerror('速度无效', '机械臂速度必须大于 0 mm/s。')
+            return
+        if not self.save_exec_from_ui():
+            return
+        self.start_worker('手动移动', self.manual_move_worker, target, speed)
 
-    def manual_move_worker(self, target):
+    def manual_move_worker(self, target, speed):
         x, y, z = target
         self.node.send_gcode('G90')
-        self.node.send_gcode('G1 Z-210.00 F80.00')
-        self.node.send_gcode('G1 X%.2f Y%.2f Z-210.00 F80.00' % (x, y))
-        self.node.send_gcode('G1 X%.2f Y%.2f Z%.2f F80.00' % (x, y, z))
-        self.current_status = '已发送手动目标 Delta XYZ=%s mm' % np.round(target, 2).tolist()
+        self.node.send_gcode('G1 Z-210.00 F%.2f' % speed)
+        self.node.send_gcode('G1 X%.2f Y%.2f Z-210.00 F%.2f' % (x, y, speed))
+        self.node.send_gcode('G1 X%.2f Y%.2f Z%.2f F%.2f' % (x, y, z, speed))
+        self.current_status = '已发送手动目标 Delta XYZ=%s mm，速度 %.1f mm/s' % (np.round(target, 2).tolist(), speed)
 
     def render_image(self, image, label, kind):
         if image is None:

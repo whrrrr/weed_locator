@@ -4,3 +4,4 @@ offset_mm:
   x: 85.0
   y: 100.0
   z: 20.0
+arm_feedrate_mm_per_sec: 80.0
