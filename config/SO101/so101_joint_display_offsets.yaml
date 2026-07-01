@@ -1,0 +1,87 @@
+description: SO101 final display offsets after visual real-vs-RViz alignment. adjusted_display = raw_input + offsets_deg.
+recorded_at: '2026-07-01T16:30:12+08:00'
+source_topic: /joint_states
+output_topic: /display_joint_states
+joints_used_for_ik:
+- shoulder_pan
+- shoulder_lift
+- elbow_flex
+command_joints:
+- shoulder_pan
+- shoulder_lift
+- elbow_flex
+- wrist_flex
+joint_name_map:
+  elbow_flex: wrist_flex
+offsets_deg:
+  shoulder_pan: 2.0
+  shoulder_lift: -19.0
+  elbow_flex: 74.0
+raw_input_pose:
+  names:
+  - shoulder_pan
+  - shoulder_lift
+  - elbow_flex
+  - wrist_flex
+  - wrist_roll
+  - gripper
+  joints:
+  - name: shoulder_pan
+    position_rad: -0.04296195081832196
+    position_deg: -2.4615384615384617
+  - name: shoulder_lift
+    position_rad: 0.322981808830599
+    position_deg: 18.505494505494507
+  - name: elbow_flex
+    position_rad: -2.867710217122991
+    position_deg: -164.30769230769232
+  - name: wrist_flex
+    position_rad: -0.43038668587640394
+    position_deg: -24.65934065934066
+  - name: wrist_roll
+    position_rad: 0.0
+    position_deg: 0.0
+  - name: gripper
+    position_rad: -0.174533
+    position_deg: -10.000004285756797
+adjusted_display_pose:
+  names:
+  - shoulder_pan
+  - shoulder_lift
+  - wrist_flex
+  - wrist_roll
+  - gripper
+  joints:
+  - name: shoulder_pan
+    source_joint: shoulder_pan
+    position_rad: -0.008055365778435367
+    position_deg: -0.4615384615384615
+  - name: shoulder_lift
+    source_joint: shoulder_lift
+    position_rad: -0.008630749048323616
+    position_deg: -0.49450549450549497
+  - name: wrist_flex
+    source_joint: elbow_flex
+    position_rad: -1.576166570647187
+    position_deg: -90.30769230769232
+  - name: wrist_roll
+    source_joint: wrist_roll
+    position_rad: 0.0
+    position_deg: 0.0
+  - name: gripper
+    source_joint: gripper
+    position_rad: -0.174533
+    position_deg: -10.000004285756797
+end_effector_tf_base_to_gripper_frame:
+  translation_m:
+  - 0.484
+  - 0.004
+  - 0.303
+  rpy_deg:
+  - 73.942
+  - 87.098
+  - 74.423
+notes:
+- User visually confirmed the real arm pose and RViz pose match at this state.
+- Real elbow_flex is mapped to URDF wrist_flex for the no-elbow kinematic model.
+- Real wrist_flex motor is not part of the current IK chain.

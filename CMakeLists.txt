@@ -239,6 +239,14 @@ install(PROGRAMS scripts/lerobot_joint_diagnostic.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME lerobot_joint_diagnostic
 )
+install(PROGRAMS scripts/lerobot_joint_offset_tuner.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_joint_offset_tuner
+)
+install(PROGRAMS scripts/lerobot_real_sim_angle_tuner.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_real_sim_angle_tuner
+)
 install(PROGRAMS scripts/lerobot_z_response_scan.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME lerobot_z_response_scan
