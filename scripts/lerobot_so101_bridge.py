@@ -72,6 +72,7 @@ class LeRobotSO101Bridge(Node):
         self.declare_parameter('use_gripper', True)
         self.declare_parameter('active_motor_joints', '')
         self.declare_parameter('motor_models', '')
+        self.declare_parameter('hardware_joint_map', '')
 
         self.robot = None
         self.last_observation = {}
@@ -127,6 +128,42 @@ class LeRobotSO101Bridge(Node):
         if unknown:
             self.get_logger().warning(f'ignoring unknown active_motor_joints: {unknown}')
         return [joint for joint in joints if joint in ALL_JOINTS]
+
+    def hardware_joint_map(self):
+        """Map logical ROS joint names to the actual LeRobot bus motor names.
+
+        This is useful for temporary physical motor swaps without changing
+        servo IDs or LeRobot calibration files. Example:
+        shoulder_lift:elbow_flex,elbow_flex:shoulder_lift
+        """
+        raw = str(self.get_parameter('hardware_joint_map').value).strip()
+        mapping = {}
+        if not raw:
+            return mapping
+        for item in raw.split(','):
+            item = item.strip()
+            if not item:
+                continue
+            if ':' not in item:
+                self.get_logger().warning(f'ignoring malformed hardware_joint_map item: {item!r}')
+                continue
+            logical, hardware = [part.strip() for part in item.split(':', 1)]
+            if logical not in ALL_JOINTS or hardware not in ALL_JOINTS:
+                self.get_logger().warning(f'ignoring invalid hardware_joint_map item: {item!r}')
+                continue
+            mapping[logical] = hardware
+        return mapping
+
+    def hardware_joint_for(self, logical_joint):
+        return self.hardware_joint_map().get(logical_joint, logical_joint)
+
+    def active_hardware_joints(self):
+        joints = []
+        for logical in self.active_motor_joints():
+            hardware = self.hardware_joint_for(logical)
+            if hardware not in joints:
+                joints.append(hardware)
+        return joints
 
     def motor_model_overrides(self):
         raw = str(self.get_parameter('motor_models').value).strip()
@@ -205,7 +242,7 @@ class LeRobotSO101Bridge(Node):
         if self.robot is None:
             return
 
-        active = set(self.active_motor_joints())
+        active = set(self.active_hardware_joints())
         overrides = self.motor_model_overrides()
         removed = []
         if hasattr(self.robot, 'bus') and hasattr(self.robot.bus, 'motors'):
@@ -213,9 +250,10 @@ class LeRobotSO101Bridge(Node):
                 if joint not in active:
                     self.robot.bus.motors.pop(joint, None)
                     removed.append(joint)
-            for joint, model in overrides.items():
-                if joint in self.robot.bus.motors:
-                    self.robot.bus.motors[joint].model = model
+            for logical_joint, model in overrides.items():
+                hardware_joint = self.hardware_joint_for(logical_joint)
+                if hardware_joint in self.robot.bus.motors:
+                    self.robot.bus.motors[hardware_joint].model = model
         for owner in (self.robot, getattr(self.robot, 'bus', None)):
             calibration = getattr(owner, 'calibration', None)
             if isinstance(calibration, dict):
@@ -227,7 +265,8 @@ class LeRobotSO101Bridge(Node):
             self.get_logger().info(f'removed inactive motors from LeRobot bus expectation: {removed}')
         if overrides:
             self.refresh_bus_cache()
-            self.get_logger().info(f'applied motor model overrides: {overrides}')
+            mapped = {self.hardware_joint_for(joint): model for joint, model in overrides.items()}
+            self.get_logger().info(f'applied motor model overrides: {mapped}')
 
     def refresh_bus_cache(self):
         bus = getattr(self.robot, 'bus', None)
@@ -245,7 +284,8 @@ class LeRobotSO101Bridge(Node):
         if not coefficients or self.robot is None or not self.robot.is_connected:
             return
 
-        for joint, p_value in coefficients.items():
+        for logical_joint, p_value in coefficients.items():
+            joint = self.hardware_joint_for(logical_joint)
             if joint not in self.robot.bus.motors:
                 self.get_logger().warning(f'skipping P coefficient for inactive motor {joint}')
                 continue
@@ -253,9 +293,9 @@ class LeRobotSO101Bridge(Node):
                 with self.robot.bus.torque_disabled(joint):
                     self.robot.bus.write('P_Coefficient', joint, p_value, normalize=False, num_retry=5)
                 readback = self.robot.bus.read('P_Coefficient', joint, normalize=False, num_retry=5)
-                self.get_logger().info(f'{joint} P_Coefficient set to {readback}')
+                self.get_logger().info(f'{logical_joint}->{joint} P_Coefficient set to {readback}')
             except Exception as exc:
-                self.get_logger().warning(f'failed to set {joint} P_Coefficient={p_value}: {exc}')
+                self.get_logger().warning(f'failed to set {logical_joint}->{joint} P_Coefficient={p_value}: {exc}')
 
     def connect_robot(self):
         with self.lock:
@@ -325,7 +365,10 @@ class LeRobotSO101Bridge(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = ALL_JOINTS
         msg.position = [
-            self.observation_to_ros_radians(joint, observation.get(f'{joint}.pos', 0.0))
+            self.observation_to_ros_radians(
+                joint,
+                observation.get(f'{self.hardware_joint_for(joint)}.pos', 0.0),
+            )
             for joint in ALL_JOINTS
         ]
         self.joint_pub.publish(msg)
@@ -362,7 +405,10 @@ class LeRobotSO101Bridge(Node):
                 response.success = False
                 return response
 
-            response.positions = [float(self.last_observation.get(f'{joint}.pos', 0.0)) for joint in ALL_JOINTS]
+            response.positions = [
+                float(self.last_observation.get(f'{self.hardware_joint_for(joint)}.pos', 0.0))
+                for joint in ALL_JOINTS
+            ]
             response.success = True
             return response
 
@@ -373,13 +419,18 @@ class LeRobotSO101Bridge(Node):
         active_joints = self.active_motor_joints()
         if len(targets) == 1 and bool(self.get_parameter('use_gripper').value):
             active_joints = ['gripper']
-        elif len(targets) < len(active_joints):
-            response.success = False
-            return response
 
         action = {}
         for joint, target in zip(active_joints, targets[: len(active_joints)]):
-            action[f'{joint}.pos'] = self.command_to_lerobot_value(joint, float(target), units)
+            target = float(target)
+            if math.isnan(target):
+                continue
+            hardware_joint = self.hardware_joint_for(joint)
+            action[f'{hardware_joint}.pos'] = self.command_to_lerobot_value(joint, float(target), units)
+
+        if not action:
+            response.success = True
+            return response
 
         with self.lock:
             if self.robot is None or not self.robot.is_connected:

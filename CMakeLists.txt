@@ -231,6 +231,10 @@ install(PROGRAMS scripts/lerobot_ik_keyboard_jog.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME lerobot_ik_keyboard_jog
 )
+install(PROGRAMS scripts/lerobot_no_elbow_ik_keyboard_jog.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_no_elbow_ik_keyboard_jog
+)
 install(PROGRAMS scripts/lerobot_joint_jog.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME lerobot_joint_jog
