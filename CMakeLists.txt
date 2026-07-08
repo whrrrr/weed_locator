@@ -223,6 +223,10 @@ install(PROGRAMS scripts/lerobot_so101_bridge.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME lerobot_so101_bridge
 )
+install(PROGRAMS scripts/lerobot_so101_profiled_bridge.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME lerobot_so101_profiled_bridge
+)
 install(PROGRAMS scripts/lerobot_ik_jog.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME lerobot_ik_jog

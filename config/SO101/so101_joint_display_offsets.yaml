@@ -14,9 +14,9 @@ command_joints:
 joint_name_map:
   elbow_flex: wrist_flex
 offsets_deg:
-  shoulder_pan: 2.0
-  shoulder_lift: -19.0
-  elbow_flex: 74.0
+  shoulder_pan: 1.0
+  shoulder_lift: -98.0
+  elbow_flex: 252.0
 raw_input_pose:
   names:
   - shoulder_pan
